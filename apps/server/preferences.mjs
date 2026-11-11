@@ -77,6 +77,18 @@ export function validatePreferences(value) {
     throw Error("Unknown preference");
   return result;
 }
+/**
+ * Execution statuses after which Sindri does nothing more. Mirrors isFinalExecution in
+ * profileForm.ts: the release ships apps/server without apps/web, so neither can import the other.
+ */
+const FINAL_EXECUTION_STATUSES = [
+  "verified_pending_review",
+  "cancelled",
+  "failed",
+];
+const isFinalExecution = (status) =>
+  FINAL_EXECUTION_STATUSES.includes(String(status)) ||
+  String(status).startsWith("delivered");
 export function attentionRecords(state) {
   const out = [];
   const push = (key, title, severity, kind, row, revision) =>
@@ -156,6 +168,14 @@ export function attentionRecords(state) {
       d,
     );
   for (const e of state.sindri.executions ?? []) {
+    if (e.execution.status === "failed")
+      push(
+        "execution:" + e.execution.id,
+        "Run failed: " + e.execution.id,
+        "error",
+        "execution",
+        e.execution,
+      );
     for (const g of e.gates ?? [])
       if (!g.passed)
         push(
@@ -163,9 +183,12 @@ export function attentionRecords(state) {
           "Verification failed: " + g.planTaskId,
           "error",
           "gate",
-          { ...g, id: g.planTaskId },
+          // A gate names no project or mission; its run ties it to the selected project.
+          { ...g, id: g.planTaskId, executionId: e.execution.id },
           g.evaluatedAt,
         );
+    // Sindri keeps the record on a finished run's tasks but refuses to resolve it.
+    if (isFinalExecution(e.execution.status)) continue;
     for (const t of e.tasks ?? [])
       if (t.escalation)
         push(

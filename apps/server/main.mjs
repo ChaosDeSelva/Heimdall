@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import {
   readFileSync,
   existsSync,
+  statSync,
   mkdirSync,
   writeFileSync,
   renameSync,
@@ -13,10 +14,12 @@ import { fileURLToPath } from "node:url";
 import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
 import { Store } from "./storage.mjs";
 import { Hub, localUrl, request } from "./connectors.mjs";
-import { commandRoute } from "./commands.mjs";
+import { commandRoute, commandTimeout } from "./commands.mjs";
 const hash = (v) => createHash("sha256").update(v).digest("hex");
+// Anything but text can never match; an empty secret is replaced at start-up.
 const equals = (a, b) =>
-  timingSafeEqual(Buffer.from(hash(a ?? "")), Buffer.from(hash(b ?? "")));
+  typeof a === "string" &&
+  timingSafeEqual(Buffer.from(hash(a)), Buffer.from(hash(b)));
 const json = (res, status, data) => {
   res.writeHead(status, {
     "content-type": "application/json",
@@ -31,7 +34,44 @@ async function body(req) {
     if (text.length > 524288)
       throw Object.assign(Error("Request too large"), { status: 413 });
   }
-  return JSON.parse(text || "{}");
+  const value = JSON.parse(text || "{}");
+  if (!value || typeof value !== "object")
+    throw Error("The request body must be a JSON object");
+  return value;
+}
+const QUERY_ID = /^[\w-]{1,200}$/;
+const QUERY_PARAMS = {
+  projectId: QUERY_ID,
+  type: /^[\w.-]{1,100}$/,
+  status: /^[\w.-]{1,100}$/,
+  limit: /^(?:[1-9]\d?|1\d\d|200)$/,
+  before: /^[\w:.+-]{1,100}$/,
+};
+/** Sindri path for a steward or Feedback Graph read, or null when the path is not one. */
+export function stewardDetail(path, params) {
+  const query = (names) => {
+    const out = new URLSearchParams();
+    for (const name of names) {
+      const value = params.get(name);
+      if (value === null || value === "") continue;
+      if (!QUERY_PARAMS[name].test(value))
+        throw Object.assign(Error(`Invalid ${name}`), { status: 400 });
+      out.set(name, value);
+    }
+    const text = out.toString();
+    return text ? "?" + text : "";
+  };
+  if (path === "/api/details/steward/status") return "/v1/steward/status";
+  if (path === "/api/details/steward/decisions")
+    return "/v1/steward/decisions" + query(["projectId", "type", "status", "limit", "before"]);
+  if (path === "/api/details/steward/notes")
+    return "/v1/steward/notes" + query(["projectId"]);
+  if (path === "/api/details/feedback-graph") return "/v1/feedback-graph/status";
+  const decision = /^\/api\/details\/steward\/decisions\/([\w-]{1,200})$/.exec(path);
+  if (decision) return `/v1/steward/decisions/${decision[1]}`;
+  const project = /^\/api\/details\/feedback-graph\/([\w-]{1,200})$/.exec(path);
+  if (project) return `/v1/projects/${project[1]}/feedback-graph`;
+  return null;
 }
 export async function startHeimdall(options = {}) {
   const env = options.env ?? process.env,
@@ -65,10 +105,12 @@ export async function startHeimdall(options = {}) {
       else delete connections[name];
     }
   const store = new Store(dataDir),
-    clients = new Set(),
-    sessions = new Map();
-  const token = env.HEIMDALL_TOKEN ?? randomBytes(24).toString("base64url"),
-    operatorCode = options.operatorCode ?? randomBytes(8).toString("hex");
+    clients = new Map(),
+    sessions = new Map(),
+    inFlight = new Set();
+  // An empty value would match an empty submission, so it counts as not set.
+  const token = env.HEIMDALL_TOKEN || randomBytes(24).toString("base64url"),
+    operatorCode = options.operatorCode || randomBytes(8).toString("hex");
   let timer;
   let closing = false;
   const broadcast = () => {
@@ -76,8 +118,14 @@ export async function startHeimdall(options = {}) {
     clearTimeout(timer);
     timer = setTimeout(() => {
       if (closing) return;
-      const data = JSON.stringify(hub.snapshot());
-      for (const res of clients) {
+      let data;
+      // A throw in a timer would end the process; the next change sends a fresh snapshot.
+      try {
+        data = JSON.stringify(hub.snapshot());
+      } catch {
+        return;
+      }
+      for (const res of clients.keys()) {
         if (res.writableLength > 2 * 1024 * 1024) {
           res.destroy();
           clients.delete(res);
@@ -86,10 +134,19 @@ export async function startHeimdall(options = {}) {
     }, 100);
   };
   let hub = new Hub(connections, store, broadcast);
-  const web = resolve(fileURLToPath(new URL("../../dist/", import.meta.url)));
+  const web = resolve(
+    options.webDir ??
+      process.env.HEIMDALL_WEB_DIR ??
+      fileURLToPath(new URL("../../dist/", import.meta.url)),
+  );
+  const heartbeatMs = options.heartbeatMs ?? 15000;
   let boundPort = port;
-  let loginFailures = 0,
-    lockedUntil = 0;
+  // Separate counts: a token holder must not be able to reset the operator-code lockout.
+  const attempts = { login: { failures: 0, lockedUntil: 0 }, unlock: { failures: 0, lockedUntil: 0 } };
+  const failedAttempt = (kind) => {
+    if (++attempts[kind].failures >= 5)
+      attempts[kind] = { failures: 0, lockedUntil: Date.now() + 60000 };
+  };
   const server = createServer(async (req, res) => {
     res.setHeader("x-content-type-options", "nosniff");
     res.setHeader("referrer-policy", "no-referrer");
@@ -99,6 +156,8 @@ export async function startHeimdall(options = {}) {
     );
     try {
       const hosts = [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`];
+      // Browsers share cookies between ports of one host, so each instance names its own.
+      const cookieName = "heimdall_" + boundPort;
       if (!hosts.includes(req.headers.host))
         throw Object.assign(Error("Invalid host"), { status: 403 });
       if (
@@ -115,8 +174,13 @@ export async function startHeimdall(options = {}) {
           throw Object.assign(Error("Method not allowed"), { status: 405 });
         const asset =
           path === "/" ? "index.html" : decodeURIComponent(path).slice(1);
-        const file = resolve(web, asset);
-        if (!file.startsWith(web + "/") || !existsSync(file))
+        let file = resolve(web, asset);
+        if (!file.startsWith(web + "/"))
+          throw Object.assign(Error("Not found"), { status: 404 });
+        // The app routes by path (/pipeline, /docs/glossary): a path without a file extension
+        // that is not a file is one of its pages, so it gets the app. Missing assets stay 404.
+        if (!existsSync(file) && !extname(asset)) file = resolve(web, "index.html");
+        if (!existsSync(file) || !statSync(file).isFile())
           throw Object.assign(Error("Not found"), { status: 404 });
         res.setHeader(
           "content-type",
@@ -135,19 +199,20 @@ export async function startHeimdall(options = {}) {
           status: 403,
         });
       if (path === "/api/login" && req.method === "POST") {
-        if (Date.now() < lockedUntil)
+        if (Date.now() < attempts.login.lockedUntil)
           throw Object.assign(
             Error("Too many attempts. Try again in one minute."),
             { status: 429 },
           );
         const b = await body(req);
         if (!equals(b.token, token)) {
-          if (++loginFailures >= 5) {
-            lockedUntil = Date.now() + 60000;
-            loginFailures = 0;
-          }
+          failedAttempt("login");
           throw Object.assign(Error("Invalid access token"), { status: 401 });
         }
+        attempts.login.failures = 0;
+        // Sessions are only ever added here, so pruning here keeps the map bounded.
+        for (const [id, s] of sessions)
+          if (s.expires < Date.now()) sessions.delete(id);
         const sid = randomBytes(32).toString("base64url");
         sessions.set(sid, {
           expires: Date.now() + 12 * 3600000,
@@ -156,22 +221,28 @@ export async function startHeimdall(options = {}) {
         });
         res.setHeader(
           "set-cookie",
-          `heimdall=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200`,
+          `${cookieName}=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200`,
         );
         return json(res, 200, { ok: true });
       }
-      const sid = /\bheimdall=([^;]+)/.exec(req.headers.cookie ?? "")?.[1];
+      const sid = new RegExp(`(?:^|;\\s*)${cookieName}=([^;]+)`).exec(
+        req.headers.cookie ?? "",
+      )?.[1];
       const session = sessions.get(sid);
-      if (!session || session.expires < Date.now())
+      if (!session || session.expires < Date.now()) {
+        sessions.delete(sid);
         throw Object.assign(
           Error("Sign in with the access token printed in the launcher."),
           { status: 401 },
         );
+      }
       if (path === "/api/logout" && req.method === "POST") {
         sessions.delete(sid);
+        for (const [stream, owner] of clients)
+          if (owner === sid) stream.end();
         res.setHeader(
           "set-cookie",
-          "heimdall=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+          `${cookieName}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`,
         );
         return json(res, 200, { ok: true });
       }
@@ -181,20 +252,18 @@ export async function startHeimdall(options = {}) {
           pairedSindri: !!session.approvalSecret,
         });
       if (path === "/api/unlock" && req.method === "POST") {
-        if (Date.now() < lockedUntil)
+        if (Date.now() < attempts.unlock.lockedUntil)
           throw Object.assign(Error("Too many attempts. Try later."), {
             status: 429,
           });
         const b = await body(req);
         if (!equals(b.code, operatorCode)) {
-          if (++loginFailures >= 5) {
-            lockedUntil = Date.now() + 60000;
-            loginFailures = 0;
-          }
+          failedAttempt("unlock");
           throw Object.assign(Error("Incorrect operator code"), {
             status: 403,
           });
         }
+        attempts.unlock.failures = 0;
         session.operator = true;
         store.audit({
           actor: "local operator",
@@ -213,6 +282,14 @@ export async function startHeimdall(options = {}) {
           method: "POST",
           body: JSON.stringify({ pairingCode: b.code, channel: "web" }),
         });
+        // Without a secret every Sindri control would be refused later, so this is no pairing.
+        if (typeof r?.approvalSecret !== "string" || !r.approvalSecret)
+          throw Object.assign(
+            Error("Sindri did not return an approval secret"),
+            {
+              status: 502,
+            },
+          );
         session.approvalSecret = r.approvalSecret;
         return json(res, 200, { paired: true, expiresAt: r.expiresAt });
       }
@@ -302,10 +379,13 @@ export async function startHeimdall(options = {}) {
         if (next && !next.token) throw Error("A source token is required");
         if (next) {
           try {
-            await request(
+            const answer = await request(
               next,
               b.source === "mimir" ? "/v1/snapshot" : "/v1/projects",
             );
+            // Any 200 is not enough: a different local service, or the other source, would pass.
+            if (!Array.isArray(answer[b.source === "mimir" ? "missions" : "projects"]))
+              throw Error("Not this source");
           } catch (e) {
             throw Object.assign(
               Error(
@@ -373,6 +453,10 @@ export async function startHeimdall(options = {}) {
           }),
         );
       }
+      // Mimir's attention list (budgets at their warning fraction or used up, with spend and
+      // limits), read-only: the Raise budget form shows the current numbers from it.
+      if (path === "/api/attention" && req.method === "GET")
+        return json(res, 200, hub.clean(await request(connections.mimir, "/v1/attention")));
       if (path === "/api/harnesses" && req.method === "GET")
         return json(res, 200, hub.clean(await request(connections.mimir, "/v1/harnesses")));
       if (path === "/api/fleet" && req.method === "GET")
@@ -400,25 +484,29 @@ export async function startHeimdall(options = {}) {
           ),
         );
       if (path === "/api/snapshot") return json(res, 200, hub.snapshot());
-      if (path === "/api/events")
+      if (path === "/api/events") {
+        const before = url.searchParams.get("before");
+        if (before !== null && !/^\d{1,15}$/.test(before))
+          throw Error("before must be an event sequence number");
         return json(res, 200, {
           events: store.events(Object.fromEntries(url.searchParams)),
         });
+      }
       if (path === "/api/stream") {
+        // Built before the headers go out, so a failure here is still an ordinary error answer.
+        const first = JSON.stringify(hub.snapshot());
         res.writeHead(200, {
           "content-type": "text/event-stream",
           "cache-control": "no-store",
           connection: "keep-alive",
         });
-        res.write(
-          `event: snapshot\ndata: ${JSON.stringify(hub.snapshot())}\n\n`,
-        );
-        clients.add(res);
+        res.write(`event: snapshot\ndata: ${first}\n\n`);
+        clients.set(res, sid);
         const ping = setInterval(() => {
           if (!sessions.has(sid) || session.expires < Date.now())
             return res.end();
           res.write(": heartbeat\n\n");
-        }, 15000);
+        }, heartbeatMs);
         req.on("close", () => {
           clearInterval(ping);
           clients.delete(res);
@@ -428,8 +516,39 @@ export async function startHeimdall(options = {}) {
       const artifact = /^\/api\/artifacts\/([\w-]+)$/.exec(path);
       if (artifact && req.method === "GET")
         return json(res, 200, await hub.artifact(artifact[1]));
+      // Sindri's read-only Guide. POST only because it carries a question: it changes nothing,
+      // so a signed-in read session is enough (no operator unlock, no idempotency key). Sindri
+      // validates the body and rate-limits; its 422/429/503 come back as they are.
+      if (path === "/api/details/guide/ask" && req.method === "POST") {
+        const question = JSON.stringify(await body(req));
+        let answer;
+        try {
+          answer = await request(connections.sindri, "/v1/guide/ask", {
+            method: "POST",
+            body: question,
+            // Sindri's rate limit is per token; every Heimdall operator shares this one, so each
+            // signed-in session gets its own bucket. A one-way hash: the session ID stays here.
+            headers: {
+              "x-guide-client": createHash("sha256")
+                .update("guide-client:" + sid)
+                .digest("hex"),
+            },
+            timeoutMs: 120000,
+          });
+        } catch (e) {
+          if (e.name === "TimeoutError") e.status = 504;
+          e.status ??= 502;
+          throw e;
+        }
+        return json(res, 200, hub.clean(answer));
+      }
+      if (path.startsWith("/api/details/") && req.method === "GET") {
+        const upstream = stewardDetail(path, url.searchParams);
+        if (upstream)
+          return json(res, 200, hub.clean(await request(connections.sindri, upstream)));
+      }
       const detail =
-        /^\/api\/details\/(specs|plans|intakes|deliveries|questions|local)\/([\w-]+)$/.exec(
+        /^\/api\/details\/(specs|plans|intakes|deliveries|questions|local|profile)\/([\w-]+)$/.exec(
           path,
         );
       if (detail && req.method === "GET") {
@@ -439,12 +558,27 @@ export async function startHeimdall(options = {}) {
             ? `/v1/specs/${id}/questions`
             : kind === "local"
               ? `/v1/deliveries/${id}/local`
-              : `/v1/${kind}/${id}`;
-        return json(
-          res,
-          200,
-          hub.clean(await request(connections.sindri, upstream)),
-        );
+              : kind === "profile"
+                ? `/v1/projects/${id}/profile`
+                : `/v1/${kind}/${id}`;
+        const raw = await request(connections.sindri, upstream);
+        const cleaned = hub.clean(raw);
+        // The form saves what it shows, so it must know when a value was replaced for display.
+        if (kind === "profile")
+          cleaned.altered = JSON.stringify(cleaned) !== JSON.stringify(raw);
+        if (kind === "local") {
+          // A patch has to apply byte for byte, so the display rewrite skips it. It is the
+          // operator's own repository diff; only this app's source tokens are still withheld.
+          const tokens = Object.values(connections).map((c) => c?.token).filter(Boolean);
+          const exact = (shown, patch) => {
+            if (typeof patch !== "string" || !shown) return;
+            shown.patchExact = !tokens.some((t) => patch.includes(t));
+            if (shown.patchExact) shown.patch = patch;
+          };
+          exact(cleaned.result, raw.result?.patch);
+          exact(cleaned.result?.followUp, raw.result?.followUp?.patch);
+        }
+        return json(res, 200, cleaned);
       }
       if (path === "/api/commands" && req.method === "POST") {
         if (!session.operator)
@@ -493,6 +627,7 @@ export async function startHeimdall(options = {}) {
           );
           if (owner) {
             route.source = "sindri";
+            route.approval = true;
             route.path = `/v1/executions/${owner.execution.id}/approvals/${c.id}`;
           } else if (
             connections.sindri &&
@@ -510,36 +645,53 @@ export async function startHeimdall(options = {}) {
             Error(
               "Pair with Sindri in Connections before issuing its controls",
             ),
-            { status: 403 },
+            { status: 403, code: "pairing_required" },
           );
-        store.receiptPut(key, fingerprint, 409, {
-          message:
-            "Command is pending or outcome is uncertain. Inspect source state before retrying.",
-        });
-        store.audit({
-          actor: "local operator",
-          action: c.action,
-          id: c.id,
-          reason: c.reason,
-          key,
-          outcome: "requested",
-        });
+        // Only final outcomes get a receipt. A resend after a timeout or source error is
+        // forwarded with the same key, and the source's own idempotency answers it.
+        // The browser says which type it accepts; Sindri's own record decides, so an approval
+        // can never be sent without the approval factor under a mislabelled type.
+        if (c.action === "steward.accept") {
+          const { decision } = await request(
+            connections.sindri,
+            `/v1/steward/decisions/${encodeURIComponent(c.id)}`,
+          );
+          if (decision?.type !== c.decisionType)
+            throw Object.assign(
+              Error("This decision is not the type shown. Refresh the Autonomy page and review it again."),
+              { status: 409 },
+            );
+        }
+        if (inFlight.has(key))
+          throw Object.assign(
+            Error(
+              "This command is still waiting for the source. Its outcome will appear here; check the Pipeline before sending again.",
+            ),
+            { status: 409 },
+          );
+        inFlight.add(key);
+        const timeoutMs = options.commandTimeout?.(c.action) ?? commandTimeout(c.action);
+        // Everything after the key is taken sits inside the try, so the key is always released.
         try {
+          store.audit({
+            actor: "local operator",
+            action: c.action,
+            id: c.id,
+            reason: c.reason,
+            key,
+            outcome: "requested",
+          });
           const result = await request(connections[route.source], route.path, {
-            method: "POST",
+            method: route.method,
             headers: {
               "idempotency-key": key,
               "x-heimdall-audit": key,
-              ...(route.source === "sindri"
+              ...(route.source === "sindri" && route.approval
                 ? { "x-sindri-approval": session.approvalSecret }
                 : {}),
             },
             body: JSON.stringify(route.body),
-            signal: AbortSignal.timeout(
-              ["spec.draft", "plan.propose", "task.verify"].includes(c.action)
-                ? 180000
-                : 30000,
-            ),
+            timeoutMs,
           });
           const response = hub.clean({
             confirmed: true,
@@ -557,23 +709,49 @@ export async function startHeimdall(options = {}) {
           await hub.refresh();
           return json(res, 200, response);
         } catch (e) {
-          const status = e.status ?? 502;
-          const response = { message: hub.clean(e.message), confirmed: false };
-          store.receiptPut(key, fingerprint, status, response);
+          const timedOut = e.name === "TimeoutError";
+          const status = timedOut ? 504 : (e.status ?? 502);
+          const unpaired =
+            route.source === "sindri" &&
+            e.status === 403 &&
+            e.code === "approval_required";
+          if (unpaired) session.approvalSecret = null;
+          const working = e.code === "idempotency_in_progress";
+          const final = !unpaired && !working && status < 500;
+          const response = {
+            message: timedOut
+              ? `The source did not answer within ${Math.round(timeoutMs / 60000) || 1} minute(s). The work may still be running: check the Pipeline before retrying. Sending again with the same details continues this request instead of starting a second one.`
+              : working
+                ? "The source is still working on this request. Check the Pipeline, and send again later to collect the result."
+                : unpaired
+                  ? "Sindri no longer accepts this approval pairing. Pair again under Connections, then send again."
+                  : hub.clean(e.message),
+            confirmed: false,
+            ...(final ? {} : { retryable: true }),
+            ...(unpaired ? { code: "pairing_required" } : {}),
+          };
+          if (final) store.receiptPut(key, fingerprint, status, response);
           store.audit({
             actor: "local operator",
             action: c.action,
             id: c.id,
             key,
-            outcome: "failed or unconfirmed",
+            outcome: final ? "failed" : "unconfirmed; may be retried",
             status,
           });
           return json(res, status, response);
+        } finally {
+          inFlight.delete(key);
         }
       }
       throw Object.assign(Error("Not found"), { status: 404 });
     } catch (e) {
-      json(res, e.status ?? 400, { message: hub.clean(e.message) });
+      // After the headers went out there is no status left to send; a second one would throw.
+      if (res.headersSent) return void res.destroy();
+      json(res, e.status ?? 400, {
+        message: hub.clean(String(e?.message ?? e)),
+        ...(e?.code === "pairing_required" ? { code: e.code } : {}),
+      });
     }
   });
   await new Promise((ok, fail) => {
@@ -590,12 +768,13 @@ export async function startHeimdall(options = {}) {
       return hub;
     },
     store,
+    sessions,
     close: async () => {
       if (closing) return;
       closing = true;
       hub.stop();
       clearTimeout(timer);
-      for (const r of clients) r.end();
+      for (const r of clients.keys()) r.end();
       await new Promise((r) => server.close(r));
       store.close();
     },
