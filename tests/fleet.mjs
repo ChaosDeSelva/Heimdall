@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import { startHeimdall } from "../apps/server/main.mjs";
-import { startMimir } from "../../../work/ecosystem/mimir/apps/server/dist/start.js";
+import { startMimir } from "../../Mimir/apps/server/dist/start.js";
 const root = mkdtempSync(join(tmpdir(), "fleet-ui-"));
 const config = join(root, "fleet.json");
 writeFileSync(

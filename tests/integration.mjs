@@ -4,55 +4,55 @@ import { join, resolve } from "node:path";
 import assert from "node:assert/strict";
 const { buildServer: buildMimir } = await import(
   new URL(
-    "../../../work/ecosystem/mimir/apps/server/dist/index.js",
+    "../../Mimir/apps/server/dist/index.js",
     import.meta.url,
   )
 );
 const { openEventStore } = await import(
   new URL(
-    "../../../work/ecosystem/mimir/packages/core/dist/index.js",
+    "../../Mimir/packages/core/dist/index.js",
     import.meta.url,
   )
 );
 const { FakeRuntime } = await import(
   new URL(
-    "../../../work/ecosystem/mimir/packages/fake-runtime/dist/index.js",
+    "../../Mimir/packages/fake-runtime/dist/index.js",
     import.meta.url,
   )
 );
 const { buildServer: buildSindri } = await import(
   new URL(
-    "../../../work/ecosystem/sindri/apps/server/dist/app.js",
+    "../../Sindri/apps/server/dist/app.js",
     import.meta.url,
   )
 );
 const { openDatabase } = await import(
   new URL(
-    "../../../work/ecosystem/sindri/packages/knowledge/dist/index.js",
+    "../../Sindri/packages/knowledge/dist/index.js",
     import.meta.url,
   )
 );
 const { FakeProvider } = await import(
   new URL(
-    "../../../work/ecosystem/sindri/packages/director/dist/index.js",
+    "../../Sindri/packages/director/dist/index.js",
     import.meta.url,
   )
 );
 const { demoPlanResponder } = await import(
   new URL(
-    "../../../work/ecosystem/sindri/apps/server/dist/demo-plan-responder.js",
+    "../../Sindri/apps/server/dist/demo-plan-responder.js",
     import.meta.url,
   )
 );
 const { writeDemoRepo, DEMO_TICKET } = await import(
   new URL(
-    "../../../work/ecosystem/sindri/apps/server/dist/demo-repo.js",
+    "../../Sindri/apps/server/dist/demo-repo.js",
     import.meta.url,
   )
 );
 const { SettingsStore } = await import(
   new URL(
-    "../../../work/ecosystem/sindri/apps/server/dist/settings.js",
+    "../../Sindri/apps/server/dist/settings.js",
     import.meta.url,
   )
 );
@@ -175,7 +175,7 @@ try {
   assert.equal(snap.mimir.tasks[0].priority, 80);
   const { chromium } = await import("@playwright/test");
   browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext();
+  const context = await browser.newContext({ viewport: { width: 1440, height: 1050 } });
   const split = cookie.indexOf("=");
   await context.addCookies([
     {
@@ -188,6 +188,7 @@ try {
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.goto(h.url);
+
   await page
     .getByRole("banner")
     .getByRole("button", { name: "New work", exact: true })

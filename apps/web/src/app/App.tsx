@@ -526,7 +526,7 @@ export function App() {
         appName="Heimdall"
         pageTitle={PAGE_TITLES[page]}
         routeKey={page + "/" + route.sub}
-        apps={switcherApps(href("overview"))}
+        apps={switcherApps(href("overview"), state?.appOrigins)}
         currentApp="heimdall"
         projects={all.activeProjects.map((p) => ({
           id: projectKey(p),

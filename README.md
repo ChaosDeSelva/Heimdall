@@ -92,3 +92,5 @@ The demo uses explicitly synthetic data on port 4322. The runtime uses Node HTTP
 ## Experimental release status
 
 The experimental public source prerelease is `v0.1.0`. See [release scope and setup](RELEASE-v0.1.0.md) for tested behavior and acceptance limits. Manual accessibility testing is pending. Vendor integrations without authenticated live acceptance remain experimental.
+
+The connected integration and fleet tests use built sibling checkouts named `Mimir` and `Sindri`. Build those services first, then run `npm run test:integration` and `npm run test:fleet` from this repository.

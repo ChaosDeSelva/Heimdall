@@ -515,6 +515,11 @@ export class Hub {
   snapshot() {
     return this.clean({
       ...this.state,
+      appOrigins: Object.fromEntries(
+        Object.entries(this.connections)
+          .filter(([, connection]) => connection?.url)
+          .map(([name, connection]) => [name, connection.url]),
+      ),
       events: this.store.events(),
       preferences: this.store.preferences(),
       notifications: this.store.notifications(),
