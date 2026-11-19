@@ -85,12 +85,10 @@ pnpm release:local
 node examples/demo.mjs
 ```
 
-`pnpm test:integration` additionally exercises the real source APIs and browser plan editing when the built sibling sources exist under `../../work/ecosystem/` (the layout of this installation).
+With built sibling checkouts named `Mimir` and `Sindri`, run `pnpm test:integration` to exercise the real APIs and browser plan editing. Run `pnpm test:fleet` to exercise worker and supervisor controls against Mimir.
 
 The demo uses explicitly synthetic data on port 4322. The runtime uses Node HTTP/SQLite; the UI uses React/TypeScript/Vite and a custom accessible graph. There is no mandatory hosted service. See [architecture and security](docs/architecture.md). Source is published on GitHub; no registry package is required for the local build.
 
 ## Experimental release status
 
 The experimental public source prerelease is `v0.1.0`. See [release scope and setup](RELEASE-v0.1.0.md) for tested behavior and acceptance limits. Manual accessibility testing is pending. Vendor integrations without authenticated live acceptance remain experimental.
-
-The connected integration and fleet tests use built sibling checkouts named `Mimir` and `Sindri`. Build those services first, then run `npm run test:integration` and `npm run test:fleet` from this repository.
