@@ -46,7 +46,7 @@ const page = await context.newPage();
 page.setDefaultTimeout(10000);
 const errors = [];
 page.on("pageerror", (e) => errors.push(e.message));
-const TABS = ["Overview", "Pipeline", "Crews & agents", "Execution graph", "Activity", "Quality & approvals", "Autonomy"];
+const TABS = ["Overview", "Pipeline", "Crews & agents", "Execution graph", "Activity", "In progress", "Quality & approvals", "Autonomy"];
 const GLOBALS = ["Notifications", "Projects", "Connections", "Fleet", "Autonomy (all)"];
 const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const h1 = (name) => page.getByRole("heading", { level: 1, name, exact: true });
@@ -64,7 +64,7 @@ const closeInspector = async () => {
   await inspector.getByRole("button", { name: "Close", exact: true }).click();
   await inspector.waitFor({ state: "hidden" });
 };
-const commandDialog = page.getByRole("dialog").filter({ hasText: "This request changes the owning service" });
+const commandDialog = page.getByRole("dialog").filter({ hasText: "Confirm to send this to the factory" });
 const confirmed = async () => {
   await commandDialog.waitFor({ state: "hidden" });
   await page.getByText("Source confirmed the request. Current state is shown.").first().waitFor();
@@ -173,6 +173,12 @@ try {
 
   console.log("Execution graph");
   await nav("Execution graph");
+  // Graphs start collapsed; opening one shows its nodes.
+  assert.equal(await page.locator(".graph-node").count(), 0);
+  const showAll = async () => {
+    for (const b of await page.getByRole("button", { name: "Show graph" }).all()) await b.click();
+  };
+  await showAll();
   const graphNode = page.locator(".graph-node").filter({ hasText: "Implement integer-cent totals" });
   await graphNode.focus();
   await page.keyboard.press("Alt+ArrowRight");
@@ -180,6 +186,7 @@ try {
   await until(() => app.store.preferences().graphs?.msn_demo?.tsk_demo?.x === 50, "the saved layout");
   await page.reload();
   await h1("Execution graph").waitFor();
+  await showAll();
   assert.equal(await graphNode.evaluate((e) => e.style.left), "50px");
   await graphNode.dispatchEvent("click");
   await inspector.getByRole("heading", { name: "Task objective" }).waitFor();
@@ -264,9 +271,9 @@ try {
       await route.abort("failed");
     } else await route.continue();
   });
-  await commandDialog.getByRole("button", { name: "Send to source" }).click();
+  await commandDialog.getByRole("button", { name: "Confirm" }).click();
   await commandDialog.getByRole("alert").filter({ hasText: /fetch/i }).first().waitFor();
-  await commandDialog.getByRole("button", { name: "Send to source" }).click();
+  await commandDialog.getByRole("button", { name: "Confirm" }).click();
   await confirmed();
   await page.unroute("**/api/commands");
   assert.equal(source.data.missions[0].status, "paused");
@@ -294,7 +301,7 @@ try {
   await budgetDialog.getByRole("button", { name: "Review budget change" }).click();
   await commandDialog.getByRole("heading", { name: "Raise budget" }).waitFor();
   await commandDialog.getByLabel("Reason", { exact: true }).fill("Finish the summary");
-  await commandDialog.getByRole("button", { name: "Send to source" }).click();
+  await commandDialog.getByRole("button", { name: "Confirm" }).click();
   await confirmed();
   const patch = source.requests.find((r) => r.method === "PATCH" && r.path === "/v1/crews/crw_demo/budget");
   assert.ok(patch, "the PATCH reached Mimir");
@@ -317,7 +324,7 @@ try {
   await inspector.getByRole("button", { name: "Review budget change" }).click();
   await commandDialog.getByRole("heading", { name: "Raise budget" }).waitFor();
   await commandDialog.getByLabel("Reason", { exact: true }).fill("Usage is not reported by this runtime");
-  await commandDialog.getByRole("button", { name: "Send to source" }).click();
+  await commandDialog.getByRole("button", { name: "Confirm" }).click();
   await confirmed();
   const allow = source.requests.findLast((r) => r.method === "PATCH" && r.path === "/v1/crews/crw_two/budget");
   assert.deepEqual(JSON.parse(allow.body), { onUnknown: "allow" });
@@ -367,7 +374,7 @@ try {
 
   for (const width of [390, 768, 1024, 1600]) {
     await page.setViewportSize({ width, height: 1000 });
-    for (const path of ["/", "/projects", "/pipeline", "/crews", "/graph", "/activity", "/quality", "/autonomy", "/new-work", "/notifications", "/connections", "/fleet", "/autonomy/all", "/docs"]) {
+    for (const path of ["/", "/projects", "/pipeline", "/crews", "/graph", "/activity", "/quality", "/autonomy", "/new-work", "/in-progress", "/notifications", "/connections", "/fleet", "/autonomy/all", "/docs"]) {
       await page.goto(app.url + path + "?project=prj_demo");
       await page.getByRole("heading", { level: 1 }).first().waitFor();
       assert.equal(await noOverflow(), true, `${path}: page overflow at ${width}px`);

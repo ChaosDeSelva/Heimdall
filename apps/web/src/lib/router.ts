@@ -6,11 +6,13 @@ import { useSyncExternalStore, type MouseEvent } from "react";
 export type PageId =
   | "overview"
   | "new-work"
+  | "in-progress"
   | "pipeline"
   | "crews-agents"
   | "execution-graph"
   | "activity"
   | "quality-approvals"
+  | "documents"
   | "autonomy"
   | "notifications"
   | "projects"
@@ -22,11 +24,13 @@ export type PageId =
 export const PATHS: Record<PageId, string> = {
   overview: "/",
   "new-work": "/new-work",
+  "in-progress": "/in-progress",
   pipeline: "/pipeline",
   "crews-agents": "/crews",
   "execution-graph": "/graph",
   activity: "/activity",
   "quality-approvals": "/quality",
+  documents: "/documents",
   autonomy: "/autonomy",
   notifications: "/notifications",
   projects: "/projects",
@@ -39,6 +43,7 @@ export const PATHS: Record<PageId, string> = {
 /** Pages that show every project; the picker is disabled on them. */
 export const GLOBAL_PAGES: readonly PageId[] = [
   "notifications",
+  "documents",
   "projects",
   "connections",
   "fleet",

@@ -2,6 +2,7 @@
 // the actions that apply to it. Every action proposes a command; the command dialog asks for the
 // audit reason. A disabled action says why in its tooltip and once in a line below the buttons.
 import {
+  AgentTranscript,
   Button,
   Callout,
   Card,
@@ -19,7 +20,8 @@ import {
 } from "@factory/ui";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useHeimdall } from "./context";
-import { Raw, Reasons, Status, label } from "../components/app";
+import { DrawerActions, DrawerFooter } from "./DrawerActions";
+import { IntakeStatus, Raw, Reasons, Status, label } from "../components/app";
 import { download, type R } from "../lib/api";
 import { RaiseBudgetForm } from "../features/Budget";
 import { eventContext, eventSubject, eventTitle } from "../features/events";
@@ -39,10 +41,15 @@ import {
   scopeOf,
 } from "../features/scope";
 import { PlanEditor, SpecEditor } from "../features/Workflow";
-import { PrReviewView, ResearchView } from "../features/WorkDelivery";
-import { WorkKindBadge } from "../features/WorkForms";
-import { kindOf } from "../features/workKinds";
 import {
+  PrReviewView,
+  ProposalView,
+  ResearchView,
+} from "../features/WorkDelivery";
+import { WorkKindBadge } from "../features/WorkForms";
+import { gateResult, kindOf } from "../features/workKinds";
+import {
+  planTitle,
   actionBlock,
   deliveryTitle,
   intakeRequest,
@@ -50,8 +57,11 @@ import {
   orderedQuestions,
   projectKey,
   runTitle,
+  restartBlock,
+  revisionOf,
   sameRepo,
   statusBadge,
+  stopReasons,
 } from "../features/workflowState";
 
 const KIND_LABEL: Record<string, string> = {
@@ -76,6 +86,7 @@ const STATUS_DOMAIN: Record<string, string> = {
   missions: "mission",
   crews: "crew",
   agents: "agent",
+  approvals: "approval",
   execution: "run",
   specs: "spec",
   plans: "plan",
@@ -330,6 +341,8 @@ export function Inspector({
   cached: R | undefined;
   onClose: () => void;
 }) {
+  // The drawer's footer, where sections put their decisions (see DrawerActions).
+  const [footerEl, setFooterEl] = useState<HTMLDivElement | null>(null);
   const { state, session, propose, open, api, reloadKey, notify } =
     useHeimdall();
   const [kind = "", ...rest] = inspect.split(":");
@@ -488,15 +501,24 @@ export function Inspector({
               },
               specsAll,
             )
-          : kind === "deliveries" && deliveryTitle(row, executions, specsAll)
-            ? deliveryTitle(row, executions, specsAll)
-            : kind === "event"
-              ? eventTitle(row.type)
-              : String(label(versioned)).length > 180
-                ? String(label(versioned)).slice(0, 177) + "…"
-                : String(label(versioned));
-  const status =
-    kind === "specs" || kind === "plans"
+          : kind === "plans"
+            ? planTitle(versioned, specsAll)
+            : kind === "deliveries" && deliveryTitle(row, executions, specsAll)
+              ? deliveryTitle(row, executions, specsAll)
+              : kind === "event"
+                ? eventTitle(row.type)
+                : String(label(versioned)).length > 180
+                  ? String(label(versioned)).slice(0, 177) + "…"
+                  : String(label(versioned));
+  // A document run ends with your decision, not a status change: show the decision once made.
+  const documentDecision: string | undefined =
+    kind === "deliveries" || kind === "execution"
+      ? (details?.report?.research?.decision?.decision ??
+        details?.report?.proposal?.decision?.decision)
+      : undefined;
+  const status = documentDecision
+    ? documentDecision
+    : kind === "specs" || kind === "plans"
       ? statusBadge(kind, versioned)
       : statusBadge(kind, row);
   const liveAgent =
@@ -507,6 +529,8 @@ export function Inspector({
   const sections: ReactNode[] = [];
   const add = (key: string, node: ReactNode) =>
     sections.push(<div key={key}>{node}</div>);
+  // The record's next step, pinned under the scrolling body so it never needs a scroll to reach.
+  let footer: ReactNode = null;
 
   if (kind === "projects") {
     const sindri = sindriProjectOf(row, all.sindriProjects);
@@ -574,35 +598,39 @@ export function Inspector({
           sessions continue; use graceful stop in an agent's inspector to stop
           one.
         </p>
-        <Cluster gap={2}>
-          <Button
-            variant="secondary"
-            disabledReason={
-              operatorWhy ||
-              (row.schedulingPaused
-                ? "Scheduling is already paused."
-                : undefined)
-            }
-            onClick={() =>
-              propose("crew.pause", row.id, { expectedVersion: row.version })
-            }
-          >
-            Pause crew scheduling
-          </Button>
-          <Button
-            variant="secondary"
-            disabledReason={
-              operatorWhy ||
-              (!row.schedulingPaused ? "Scheduling is not paused." : undefined)
-            }
-            onClick={() =>
-              propose("crew.resume", row.id, { expectedVersion: row.version })
-            }
-          >
-            Resume crew scheduling
-          </Button>
-        </Cluster>
-        <Reasons reasons={[operatorWhy]} />
+        <DrawerActions>
+          <Cluster gap={2}>
+            <Button
+              variant="secondary"
+              disabledReason={
+                operatorWhy ||
+                (row.schedulingPaused
+                  ? "Scheduling is already paused."
+                  : undefined)
+              }
+              onClick={() =>
+                propose("crew.pause", row.id, { expectedVersion: row.version })
+              }
+            >
+              Pause crew scheduling
+            </Button>
+            <Button
+              variant="secondary"
+              disabledReason={
+                operatorWhy ||
+                (!row.schedulingPaused
+                  ? "Scheduling is not paused."
+                  : undefined)
+              }
+              onClick={() =>
+                propose("crew.resume", row.id, { expectedVersion: row.version })
+              }
+            >
+              Resume crew scheduling
+            </Button>
+          </Cluster>
+          <Reasons reasons={[operatorWhy]} />
+        </DrawerActions>
       </Block>,
     );
     add(
@@ -644,28 +672,31 @@ export function Inspector({
           Mission controls affect every crew in this mission. A pause controls
           scheduling; inspect agent state to confirm what is still running.
         </p>
-        <Cluster gap={2}>
-          {["pause", "resume", "cancel"].map((action) => (
-            <Button
-              key={action}
-              variant={action === "cancel" ? "danger" : "secondary"}
-              disabledReason={why(action) || undefined}
-              onClick={() =>
-                propose("mission." + action, row.id, {
-                  expectedVersion: row.version,
-                  ...(action === "cancel"
-                    ? {
-                        reason: "Operator requested cancellation from Heimdall",
-                      }
-                    : {}),
-                })
-              }
-            >
-              {action.charAt(0).toUpperCase() + action.slice(1)} mission
-            </Button>
-          ))}
-        </Cluster>
-        <Reasons reasons={[operatorWhy]} />
+        <DrawerActions>
+          <Cluster gap={2}>
+            {["pause", "resume", "cancel"].map((action) => (
+              <Button
+                key={action}
+                variant={action === "cancel" ? "danger" : "secondary"}
+                disabledReason={why(action) || undefined}
+                onClick={() =>
+                  propose("mission." + action, row.id, {
+                    expectedVersion: row.version,
+                    ...(action === "cancel"
+                      ? {
+                          reason:
+                            "Operator requested cancellation from Heimdall",
+                        }
+                      : {}),
+                  })
+                }
+              >
+                {action.charAt(0).toUpperCase() + action.slice(1)} mission
+              </Button>
+            ))}
+          </Cluster>
+          <Reasons reasons={[operatorWhy]} />
+        </DrawerActions>
       </Block>,
     );
     add(
@@ -708,6 +739,11 @@ export function Inspector({
               value: row.agentKind ?? "Not reported",
               term: "Agent kind",
             },
+            {
+              // Reported by the agent CLI itself once its session starts.
+              label: "Model",
+              value: row.model ?? "Not reported yet",
+            },
             { label: "Role", value: row.role ?? "Not reported", term: "Role" },
             {
               label: "Last source update",
@@ -733,7 +769,7 @@ export function Inspector({
           heartbeat means freshness is unknown.
         </p>
         {row.runtimeSessionId && (
-          <div>
+          <DrawerActions>
             <Button
               variant="secondary"
               disabledReason={operatorWhy || undefined}
@@ -745,7 +781,7 @@ export function Inspector({
             >
               Request graceful stop
             </Button>
-          </div>
+          </DrawerActions>
         )}
       </Block>,
     );
@@ -887,9 +923,7 @@ export function Inspector({
         "gate:" + g.planTaskId,
         <Block
           title="Verification gate"
-          actions={
-            <Status value={g.passed ? "passed" : "failed"} domain="gate" />
-          }
+          actions={<Status value={gateResult(g)} domain="gate" />}
         >
           <Raw data={g} title="Gate evidence & failures" />
         </Block>,
@@ -936,7 +970,23 @@ export function Inspector({
     add(
       "activity",
       <Block title="Activity & agent output">
-        <EventList events={relatedEvents} />
+        {/* The agent's output reads as one transcript, oldest first; other events stay a list. */}
+        {relatedEvents.some((e: R) => e.type === "session.output") && (
+          <AgentTranscript
+            lines={relatedEvents
+              .filter((e: R) => e.type === "session.output")
+              .sort((a: R, b: R) =>
+                String(a.timestamp ?? "").localeCompare(
+                  String(b.timestamp ?? ""),
+                ),
+              )
+              .map((e: R) => String(e.payload?.text ?? ""))}
+            maxHeight="420px"
+          />
+        )}
+        <EventList
+          events={relatedEvents.filter((e: R) => e.type !== "session.output")}
+        />
       </Block>,
     );
     const verifyWhy =
@@ -952,31 +1002,33 @@ export function Inspector({
     add(
       "actions",
       <Block title="Task actions">
-        <Cluster gap={2}>
-          <Button
-            variant="secondary"
-            disabledReason={verifyWhy || undefined}
-            onClick={() =>
-              propose("task.verify", currentTask.id, {
-                expectedVersion: currentTask.version,
-              })
-            }
-          >
-            Re-run verification only
-          </Button>
-          <Button
-            variant="secondary"
-            disabledReason={retryWhy || undefined}
-            onClick={() =>
-              propose("task.retry", currentTask.id, {
-                expectedVersion: currentTask.version,
-              })
-            }
-          >
-            Retry task
-          </Button>
-        </Cluster>
-        <Reasons reasons={[operatorWhy]} />
+        <DrawerActions>
+          <Cluster gap={2}>
+            <Button
+              variant="secondary"
+              disabledReason={verifyWhy || undefined}
+              onClick={() =>
+                propose("task.verify", currentTask.id, {
+                  expectedVersion: currentTask.version,
+                })
+              }
+            >
+              Re-run verification only
+            </Button>
+            <Button
+              variant="secondary"
+              disabledReason={retryWhy || undefined}
+              onClick={() =>
+                propose("task.retry", currentTask.id, {
+                  expectedVersion: currentTask.version,
+                })
+              }
+            >
+              Retry task
+            </Button>
+          </Cluster>
+          <Reasons reasons={[operatorWhy]} />
+        </DrawerActions>
       </Block>,
     );
     if (taskPlan)
@@ -1002,24 +1054,26 @@ export function Inspector({
         <p className="text-sm font-medium">{row.action}</p>
         <p className="text-sm text-muted">{row.reason}</p>
         <Raw data={row} title="Review full approval request" />
-        <Cluster gap={2}>
-          {["approved", "rejected"].map((decision) => (
-            <Button
-              key={decision}
-              variant={decision === "approved" ? "primary" : "danger"}
-              disabledReason={approvalWhy || undefined}
-              onClick={() =>
-                propose("approval.decide", row.id, {
-                  decision,
-                  reason: "Operator decision from Heimdall",
-                })
-              }
-            >
-              {decision === "approved" ? "Approve" : "Reject"}
-            </Button>
-          ))}
-        </Cluster>
-        <Reasons reasons={[approvalWhy]} />
+        <DrawerActions>
+          <Cluster gap={2}>
+            {["approved", "rejected"].map((decision) => (
+              <Button
+                key={decision}
+                variant={decision === "approved" ? "primary" : "danger"}
+                disabledReason={approvalWhy || undefined}
+                onClick={() =>
+                  propose("approval.decide", row.id, {
+                    decision,
+                    reason: "Operator decision from Heimdall",
+                  })
+                }
+              >
+                {decision === "approved" ? "Approve" : "Reject"}
+              </Button>
+            ))}
+          </Cluster>
+          <Reasons reasons={[approvalWhy]} />
+        </DrawerActions>
       </Block>,
     );
   }
@@ -1032,115 +1086,175 @@ export function Inspector({
         <p className="text-sm whitespace-pre-wrap">
           {details?.intake?.body ?? row.body}
         </p>
-        <div>
-          <Button
-            variant="primary"
-            disabledReason={why || undefined}
-            onClick={() =>
-              propose("spec.draft", "new", {
-                projectId: row.projectId,
-                intakeId: row.id,
-                request: intakeRequest(row),
-              })
-            }
-          >
-            Draft specification from intake
-          </Button>
-        </div>
-        <Reasons reasons={[why]} />
       </Block>,
+    );
+    footer = (
+      <div className="flex min-w-0 flex-1 flex-col gap-2">
+        <Button
+          variant="primary"
+          className="w-full"
+          disabledReason={why || undefined}
+          onClick={() =>
+            propose("spec.draft", "new", {
+              projectId: row.projectId,
+              intakeId: row.id,
+              request: intakeRequest(row),
+            })
+          }
+        >
+          Draft specification from intake
+        </Button>
+        <Reasons reasons={[why]} />
+      </div>
     );
   }
 
   if (kind === "specs" || kind === "plans") {
     const resource = kind === "specs" ? "spec" : "plan";
     const record = details?.spec ?? details?.plan ?? row;
-    const submitWhy = sindriWhy(resource + ".submit", record.status);
+    // Sindri refuses to approve a spec while a blocking question is open; say so before the dialog.
+    const blockingOpen: R[] =
+      kind === "specs"
+        ? (record.body?.openQuestions ?? []).filter((q: R) => q.blocking)
+        : [];
     const approveWhy =
-      sindriWhy(resource + ".approve", record.status) || acknowledgeWhy;
-    add(
-      "review",
-      <Block title="Review">
-        <Cluster gap={2}>
-          <Button
-            variant="secondary"
-            disabledReason={submitWhy || undefined}
-            onClick={() => propose(resource + ".submit", record.id)}
-          >
-            Submit for review
-          </Button>
+      sindriWhy(resource + ".approve", record.status) ||
+      acknowledgeWhy ||
+      (blockingOpen.length
+        ? `Answer the blocking ${blockingOpen.length === 1 ? "question" : `questions (${blockingOpen.length})`} first.`
+        : "");
+    const noun = kind === "specs" ? "specification" : "plan";
+    // Every review action lives in the pinned footer; the one the status calls for comes first,
+    // full width and primary, the others below it with why they're unavailable.
+    const draft = record.status === "draft";
+    const approval = (more: Record<string, boolean>) => () =>
+      propose(resource + ".approve", record.id, {
+        ...(kind === "specs" && acknowledge
+          ? { acknowledgeUntrusted: true }
+          : {}),
+        // A draft is submitted and approved in one step: one dialog, one reason.
+        ...(draft ? { submitFirst: true } : {}),
+        ...more,
+      });
+    // A revision repeats a kind of plan already approved once: one click plans and runs it.
+    const revision = revisionOf(record, all);
+    const actions = [
+      kind === "specs"
+        ? revision
+          ? {
+              id: "approve-plan",
+              label: "Approve, plan and start",
+              when: ["draft", "review"],
+              why: approveWhy,
+              run: approval({ thenPropose: true, thenStart: true }),
+            }
+          : {
+              id: "approve-plan",
+              label: "Approve and plan",
+              when: ["draft", "review"],
+              why: approveWhy,
+              run: approval({ thenPropose: true }),
+            }
+        : {
+            id: "approve-start",
+            label: "Approve and start",
+            when: ["draft", "review"],
+            why: approveWhy,
+            run: approval({ thenStart: true }),
+          },
+      {
+        id: "approve",
+        label: "Approve only",
+        when: [] as string[],
+        why: approveWhy,
+        run: approval({}),
+      },
+      {
+        // Optional: hand a draft to someone else to review before anyone approves it.
+        id: "submit",
+        label: "Submit for review",
+        when: [] as string[],
+        why: sindriWhy(resource + ".submit", record.status),
+        run: () => propose(resource + ".submit", record.id),
+      },
+      kind === "specs"
+        ? {
+            id: "propose",
+            label: "Propose implementation plan",
+            when: ["approved"],
+            why: sindriWhy("plan.propose", record.status),
+            run: () => propose("plan.propose", "new", { specId: record.id }),
+          }
+        : {
+            id: "start",
+            label: "Start approved plan",
+            when: ["approved"],
+            why: sindriWhy("execution.create", record.status),
+            run: () =>
+              propose("execution.create", "new", { planId: record.id }),
+          },
+    ];
+    const next = actions.find((a) => a.when.includes(record.status));
+    // Below the next step: only what still applies (approving without going on).
+    const rest = actions.filter(
+      (a) =>
+        a !== next &&
+        ["approve", "submit"].includes(a.id) &&
+        ["draft", "review"].includes(record.status),
+    );
+    footer = (
+      <div className="flex min-w-0 flex-1 flex-col gap-2">
+        {next && (
           <Button
             variant="primary"
-            disabledReason={approveWhy || undefined}
-            onClick={() =>
-              propose(
-                resource + ".approve",
-                record.id,
-                kind === "specs" && acknowledge
-                  ? { acknowledgeUntrusted: true }
-                  : {},
-              )
-            }
+            className="w-full"
+            disabledReason={next.why || undefined}
+            onClick={next.run}
           >
-            Approve {kind === "specs" ? "specification" : "plan"}
+            {next.label}
           </Button>
-        </Cluster>
-        <Reasons reasons={[submitWhy, approveWhy]} />
-        {kind === "specs" && details?.meta?.untrustedInstructionDetected && (
-          <Callout tone="warning" title="Flagged source instructions">
-            <Checkbox
-              checked={acknowledge}
-              onChange={(e) => setAcknowledge(e.target.checked)}
-              label="I have reviewed the flagged source instructions and explicitly acknowledge them for this specification."
-            />
-          </Callout>
         )}
-      </Block>,
+        <Cluster gap={2}>
+          {rest.map((a) => (
+            <Button
+              key={a.id}
+              variant="secondary"
+              size="sm"
+              disabledReason={a.why || undefined}
+              onClick={a.run}
+            >
+              {a.label}
+            </Button>
+          ))}
+        </Cluster>
+        <Reasons reasons={[next?.why]} />
+      </div>
     );
+    if (revision && ["draft", "review"].includes(record.status))
+      add(
+        "review",
+        <Callout tone="info" title="This is a revision">
+          {`This ${noun} revises "${revision.title}". `}
+          {kind === "specs"
+            ? "Approve, plan and start writes its plan and runs it in one step. The new version comes back to Documents and reviews with a fresh fact-check."
+            : "Approve and start runs it. The new version comes back to Documents and reviews with a fresh fact-check."}
+        </Callout>,
+      );
+    if (kind === "specs" && details?.meta?.untrustedInstructionDetected)
+      add(
+        "review",
+        <Callout tone="warning" title="Flagged source instructions">
+          <Checkbox
+            checked={acknowledge}
+            onChange={(e) => setAcknowledge(e.target.checked)}
+            label="I have reviewed the flagged source instructions and explicitly acknowledge them for this specification."
+          />
+        </Callout>,
+      );
     if (kind === "specs" && record.body)
       add("edit", <SpecEditor key={record.id} spec={record} />);
-    if (kind === "specs") {
-      const why = sindriWhy("plan.propose", record.status);
-      add(
-        "propose",
-        <div className="flex flex-col gap-2">
-          <div>
-            <Button
-              variant="secondary"
-              disabledReason={why || undefined}
-              onClick={() =>
-                propose("plan.propose", "new", { specId: record.id })
-              }
-            >
-              Propose implementation plan
-            </Button>
-          </div>
-          <Reasons reasons={[why]} />
-        </div>,
-      );
-    }
     if (kind === "plans" && record.tasks)
       add("edit", <PlanEditor key={record.id} plan={record} />);
-    if (kind === "plans") {
-      const why = sindriWhy("execution.create", record.status);
-      add(
-        "start",
-        <div className="flex flex-col gap-2">
-          <div>
-            <Button
-              variant="primary"
-              disabledReason={why || undefined}
-              onClick={() =>
-                propose("execution.create", "new", { planId: record.id })
-              }
-            >
-              Start approved plan
-            </Button>
-          </div>
-          <Reasons reasons={[why]} />
-        </div>,
-      );
-    }
     const questions = orderedQuestions(openSpec);
     if (questions.length)
       add(
@@ -1227,26 +1341,42 @@ export function Inspector({
           data={row.escalation}
           title="Why operator intervention is required"
         />
-        <Cluster gap={2}>
-          {["retry", "skip", "replan", "abort"].map((decision) => (
+        <DrawerActions>
+          <Cluster gap={2}>
+            {["retry", "skip", "replan", "abort"].map((decision) => (
+              <Button
+                key={decision}
+                variant={decision === "abort" ? "danger" : "secondary"}
+                disabledReason={resolveWhy || undefined}
+                onClick={() =>
+                  propose(
+                    "execution.resolve",
+                    row.executionId,
+                    { decision, reason: "Operator recovery decision" },
+                    { taskId: row.planTaskId },
+                  )
+                }
+              >
+                {decision.charAt(0).toUpperCase() + decision.slice(1)}
+              </Button>
+            ))}
+          </Cluster>
+          <Reasons reasons={[resolveWhy]} />
+          <p className="text-xs text-muted">
+            Retry works while the run's mission is still going. If it is refused
+            because the mission ended, restart the run instead: completed tasks
+            are kept and the rest run again.
+          </p>
+          <div>
             <Button
-              key={decision}
-              variant={decision === "abort" ? "danger" : "secondary"}
-              disabledReason={resolveWhy || undefined}
-              onClick={() =>
-                propose(
-                  "execution.resolve",
-                  row.executionId,
-                  { decision, reason: "Operator recovery decision" },
-                  { taskId: row.planTaskId },
-                )
-              }
+              variant="secondary"
+              disabledReason={sindriWhy("execution.restart") || undefined}
+              onClick={() => propose("execution.restart", row.executionId)}
             >
-              {decision.charAt(0).toUpperCase() + decision.slice(1)}
+              Restart run
             </Button>
-          ))}
-        </Cluster>
-        <Reasons reasons={[resolveWhy]} />
+          </div>
+        </DrawerActions>
       </Block>,
     );
   }
@@ -1299,22 +1429,70 @@ export function Inspector({
           </ul>
         </Callout>,
       );
+    const reasons = stopReasons(view);
+    // Offered whenever the run stopped; locked controls disable it with their reason.
+    const stopped = !restartBlock(view?.execution?.status ?? row.status);
+    const restartWhy = sindriWhy("execution.restart");
+    const ended = isFinalExecution(view?.execution?.status ?? row.status);
+    if (reasons.length)
+      add(
+        "why",
+        <Block title={stopped ? "Why it stopped" : "What it is waiting for"}>
+          <ul className="flex flex-col gap-2 text-sm">
+            {reasons.map((r) => (
+              <li key={r.task} className="[overflow-wrap:anywhere]">
+                <strong className="font-medium">{r.task}</strong>: {r.text}
+              </li>
+            ))}
+          </ul>
+        </Block>,
+      );
     add(
       "cancel",
       <Block title="Run">
         <p className="text-sm text-muted">
-          {cancelWhy ||
-            "Cancelling stops the run for good and cancels its mission. The reason you give is recorded with the run."}
+          {stopped
+            ? "Restart runs it again from where it stopped: completed tasks are kept, the rest get fresh attempts."
+            : ended
+              ? null
+              : cancelWhy ||
+                "Cancelling stops the run for good and cancels its mission. The reason you give is recorded with the run."}
         </p>
-        <div>
-          <Button
-            variant="danger"
-            disabledReason={cancelWhy || undefined}
-            onClick={() => propose("execution.cancel", id, { reason: "" })}
-          >
-            Cancel run
-          </Button>
-        </div>
+        {ended && (
+          <p className="text-sm text-muted">
+            Remove hides this run and its documents from every list, for example
+            a duplicate. Nothing is deleted: Sindri keeps the run and can list
+            it again.
+          </p>
+        )}
+        <DrawerActions>
+          {stopped && (
+            <Button
+              variant="primary"
+              disabledReason={restartWhy || undefined}
+              onClick={() => propose("execution.restart", id)}
+            >
+              Restart run
+            </Button>
+          )}
+          {ended ? (
+            <Button
+              variant="danger"
+              disabledReason={sindriWhy("execution.remove") || undefined}
+              onClick={() => propose("execution.remove", id)}
+            >
+              Remove run
+            </Button>
+          ) : (
+            <Button
+              variant="danger"
+              disabledReason={cancelWhy || undefined}
+              onClick={() => propose("execution.cancel", id, { reason: "" })}
+            >
+              Cancel run
+            </Button>
+          )}
+        </DrawerActions>
       </Block>,
     );
     if (runTasks.length)
@@ -1330,11 +1508,16 @@ export function Inspector({
     kind === "deliveries"
       ? (details?.report?.workKind ?? kindOf(row, s.plans ?? [], executions))
       : undefined;
-  const workView = workKind === "research" || workKind === "pr_review";
+  const workView =
+    workKind === "research" ||
+    workKind === "pr_review" ||
+    workKind === "proposal";
   if (kind === "deliveries" && workView) {
     const report = details?.report;
     if (report?.workKind === "research")
       add("research", <ResearchView executionId={id} report={report} />);
+    else if (report?.workKind === "proposal")
+      add("plan", <ProposalView executionId={id} report={report} />);
     else if (report?.workKind === "pr_review")
       add(
         "review",
@@ -1607,47 +1790,62 @@ export function Inspector({
       title={title}
       description={`${KIND_LABEL[kind] ?? "Record"} inspector`}
       className="max-w-[720px]"
-    >
-      <Stack gap={6}>
-        <div className="flex flex-wrap items-center gap-2">
-          {status != null && (
-            <Status value={status} domain={STATUS_DOMAIN[kind]} />
-          )}
-          {["deliveries", "intakes", "execution"].includes(kind) && (
-            <WorkKindBadge
-              kind={
-                kind === "deliveries"
-                  ? workKind
-                  : kind === "execution"
-                    ? kindOf(
-                        executions.find((e) => e.execution.id === id) ?? row,
-                        s.plans ?? [],
-                      )
-                    : (details?.intake?.workKind ?? row.workKind)
-              }
-            />
-          )}
-          {["specs", "plans"].includes(kind) && versioned.version != null ? (
-            <span className="font-mono text-xs text-muted">{`v${versioned.version} · ${versioned.id}`}</span>
-          ) : (
-            <Id value={id} />
-          )}
+      footer={
+        <div
+          ref={setFooterEl}
+          data-drawer-footer
+          className="flex min-w-0 flex-1 flex-col gap-3"
+        >
+          {footer}
         </div>
-        {missing && (
-          <Callout tone="warning">
-            This record is absent from the latest source snapshot. These
-            retained details are historical.
-          </Callout>
-        )}
-        {sourceOffline && (
-          <Callout tone="warning">
-            A source is disconnected. Details may be stale; check Connections
-            before acting.
-          </Callout>
-        )}
-        {detailError && <Callout tone="danger">{detailError}</Callout>}
-        {sections}
-      </Stack>
+      }
+    >
+      <DrawerFooter.Provider value={footerEl}>
+        <Stack gap={6}>
+          <div className="flex flex-wrap items-center gap-2">
+            {kind === "intakes" ? (
+              <IntakeStatus row={row} specs={specsAll} />
+            ) : (
+              status != null && (
+                <Status value={status} domain={STATUS_DOMAIN[kind]} />
+              )
+            )}
+            {["deliveries", "intakes", "execution"].includes(kind) && (
+              <WorkKindBadge
+                kind={
+                  kind === "deliveries"
+                    ? workKind
+                    : kind === "execution"
+                      ? kindOf(
+                          executions.find((e) => e.execution.id === id) ?? row,
+                          s.plans ?? [],
+                        )
+                      : (details?.intake?.workKind ?? row.workKind)
+                }
+              />
+            )}
+            {["specs", "plans"].includes(kind) && versioned.version != null ? (
+              <span className="font-mono text-xs text-muted">{`v${versioned.version} · ${versioned.id}`}</span>
+            ) : (
+              <Id value={id} />
+            )}
+          </div>
+          {missing && (
+            <Callout tone="warning">
+              This record is absent from the latest source snapshot. These
+              retained details are historical.
+            </Callout>
+          )}
+          {sourceOffline && (
+            <Callout tone="warning">
+              A source is disconnected. Details may be stale; check Connections
+              before acting.
+            </Callout>
+          )}
+          {detailError && <Callout tone="danger">{detailError}</Callout>}
+          {sections}
+        </Stack>
+      </DrawerFooter.Provider>
     </Drawer>
   );
 }

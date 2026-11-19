@@ -39,10 +39,24 @@ export function listedWork(row, kind) {
   const w = row.work;
   if (!w || typeof w !== "object" || Array.isArray(w)) return null;
   const title = typeof w.title === "string" ? w.title : null;
-  if (kind === "research")
-    return { kind, title, decision: w.decision ?? null, gatePassed: w.gatePassed === true };
+  if (kind === "research" || kind === "proposal")
+    return {
+      kind,
+      title,
+      decision: w.decision ?? null,
+      decidedAt: typeof w.decidedAt === "string" ? w.decidedAt : null,
+      decidedBy: typeof w.decidedBy === "string" ? w.decidedBy : null,
+      replacedBy: typeof w.replacedBy === "string" ? w.replacedBy : null,
+      gatePassed: w.gatePassed === true,
+      changesRequested: w.changesRequested === true,
+    };
   if (kind === "pr_review")
-    return { kind, title, posted: w.posted === true, verdict: w.verdict ?? null };
+    return {
+      kind,
+      title,
+      posted: w.posted === true,
+      verdict: w.verdict ?? null,
+    };
   return null;
 }
 
@@ -104,7 +118,9 @@ function slowRequest(url, { method = "GET", headers, body, timeoutMs }) {
         signal,
         headers: {
           ...headers,
-          ...(body == null ? {} : { "content-length": Buffer.byteLength(body) }),
+          ...(body == null
+            ? {}
+            : { "content-length": Buffer.byteLength(body) }),
         },
       },
       (res) => {
@@ -112,8 +128,7 @@ function slowRequest(url, { method = "GET", headers, body, timeoutMs }) {
         let size = 0;
         res.on("data", (chunk) => {
           size += chunk.length;
-          if (size > 12 * 1024 * 1024)
-            req.destroy(tooLarge());
+          if (size > 12 * 1024 * 1024) req.destroy(tooLarge());
           else parts.push(chunk);
         });
         res.on("error", fail);
@@ -165,7 +180,9 @@ export async function request(connection, path, options = {}) {
         });
       if (e.message !== "fetch failed") throw e;
       throw Object.assign(
-        Error(`Source is unreachable (${e.cause?.code ?? e.cause?.message ?? "network error"})`),
+        Error(
+          `Source is unreachable (${e.cause?.code ?? e.cause?.message ?? "network error"})`,
+        ),
         { status: 502 },
       );
     }
@@ -330,6 +347,8 @@ export class Hub {
                 intakes: [],
                 executions: [],
                 deliveries: [],
+                removedExecutions: [],
+                contextFiles: [],
               };
               for (const p of projects) {
                 const parts = await Promise.all(
@@ -342,7 +361,21 @@ export class Hub {
                   ),
                 );
                 for (const [k, rows] of parts) next[k].push(...rows);
+                // Removed runs, to restore one. A Sindri without removal ignores `removed` and
+                // lists every run, so only rows marked removed are kept.
+                const removed = await request(
+                  c,
+                  `/v1/executions?projectId=${encodeURIComponent(p.id)}&removed=1`,
+                ).catch(() => ({ executions: [] }));
+                next.removedExecutions.push(
+                  ...(removed.executions ?? []).filter((e) => e.removedAt),
+                );
               }
+              // Uploaded context files (Markdown, images), for Documents and New work. A Sindri
+              // without uploads answers 404: none.
+              next.contextFiles = (
+                await request(c, "/v1/context-files").catch(() => ({ files: [] }))
+              ).files ?? [];
               // Execution details carry authoritative task mappings, gates, and escalations.
               next.executions = await Promise.all(
                 next.executions.map((e) =>
@@ -409,12 +442,16 @@ export class Hub {
    */
   annotateWork(next) {
     const plans = new Map(next.plans.map((p) => [p.id, p]));
-    for (const v of next.executions) if (v.plan?.id) plans.set(v.plan.id, v.plan);
+    for (const v of next.executions)
+      if (v.plan?.id) plans.set(v.plan.id, v.plan);
     for (const d of next.deliveries) {
-      const view = next.executions.find((v) => v.execution?.id === (d.executionId ?? d.id));
+      const view = next.executions.find(
+        (v) => v.execution?.id === (d.executionId ?? d.id),
+      );
       const kind =
         d.workKind ??
-        (plans.get(d.planId ?? view?.execution?.planId) ?? view?.plan)?.work?.kind ??
+        (plans.get(d.planId ?? view?.execution?.planId) ?? view?.plan)?.work
+          ?.kind ??
         null;
       if (kind) d.workKind = kind;
       const work = listedWork(d, kind);

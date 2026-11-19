@@ -1,3 +1,4 @@
+import { documentDecision } from "./workKinds.ts";
 // Pure view logic for specifications, plans, deliveries and projects. Sindri and Mimir stay authoritative.
 type R = Record<string, any>;
 
@@ -33,8 +34,14 @@ export function statusBadge(kind: string, row: R): string | undefined {
 const needs: Record<string, [string[], string]> = {
   "spec.submit": [["draft"], "Only a draft can be submitted for review"],
   "plan.submit": [["draft"], "Only a draft can be submitted for review"],
-  "spec.approve": [["review"], "Submit it for review before approving"],
-  "plan.approve": [["review"], "Submit it for review before approving"],
+  "spec.approve": [
+    ["draft", "review"],
+    "Only a draft or a spec in review can be approved",
+  ],
+  "plan.approve": [
+    ["draft", "review"],
+    "Only a draft or a plan in review can be approved",
+  ],
   "plan.propose": [
     ["approved"],
     "Approve the specification before proposing a plan",
@@ -153,7 +160,9 @@ export const recordLabel = (r: R) =>
   r.name ??
   r.template ??
   r.action ??
-  (r.agentKind ? `${r.agentKind} · ${r.role}` : null) ??
+  (r.agentKind
+    ? `${r.agentKind}${r.model ? ` (${r.model})` : ""} · ${r.role}`
+    : null) ??
   r.type ??
   r.id;
 
@@ -174,3 +183,222 @@ export const missionSpecTitle = (
       executions.find((e) => e.execution.mimirMissionId === mission.id)?.plan
         ?.specId,
   )?.title;
+
+/** What In progress tells the operator to do now, and the record or page that does it. */
+export interface NextStep {
+  text: string;
+  open?: { kind: "intakes" | "specs" | "plans"; row: R; label: string };
+  page?: "pipeline" | "quality-approvals";
+}
+
+/**
+ * The one next step for a project's work, furthest along first: a run that needs a person, a
+ * plan to approve or start, a spec to approve or plan, a request to draft, a run to watch.
+ * `specs` and `plans` are latest versions; `executions` are Sindri's execution rows.
+ */
+export function nextStep({
+  intakes,
+  specs,
+  plans,
+  executions,
+  deliveries = [],
+  removed = [],
+}: {
+  intakes: R[];
+  specs: R[];
+  plans: R[];
+  executions: R[];
+  /** Sindri's delivery rows: a plan with one has run, even when its run is not listed. */
+  deliveries?: R[];
+  /** Removed runs: their plan ran, and is not to be started again from here. */
+  removed?: R[];
+}): NextStep | null {
+  const runOf = (plan: R) =>
+    executions.find((e) => e.execution?.planId === plan.id) ??
+    deliveries.find((d) => d.planId === plan.id) ??
+    removed.find((e) => e.planId === plan.id);
+  const status = (e: R) => String(e.execution?.status ?? "");
+  const NEEDS_YOU = [
+    "awaiting_human",
+    "verified_pending_review",
+    "blocked",
+    "replan_requested",
+  ];
+  // A delivered plan or research someone decided on (or replaced) needs nobody, though its run
+  // stays verified_pending_review.
+  const needsYou = (e: R) =>
+    NEEDS_YOU.includes(status(e)) &&
+    !documentDecision(deliveries, String(e.execution?.id ?? ""));
+  if (executions.some(needsYou))
+    return {
+      text: "A run needs you. Review it in Quality & approvals.",
+      page: "quality-approvals",
+    };
+  const plan = plans.find((p) => ["draft", "review"].includes(p.status));
+  if (plan)
+    return {
+      text: `Plan v${plan.version ?? 1} is ready. Open it and choose Approve and start.`,
+      open: { kind: "plans", row: plan, label: "Open plan" },
+    };
+  const unstarted = plans.find((p) => p.status === "approved" && !runOf(p));
+  if (unstarted)
+    return {
+      text: "The plan is approved. Open it and choose Start approved plan.",
+      open: { kind: "plans", row: unstarted, label: "Open plan" },
+    };
+  const spec = specs.find((s) => ["draft", "review"].includes(s.status));
+  if (spec)
+    return {
+      text: "The spec is ready. Answer any open questions, then choose Approve and plan.",
+      open: { kind: "specs", row: spec, label: "Open spec" },
+    };
+  const unplanned = specs.find(
+    (s) => s.status === "approved" && !plans.some((p) => p.specId === s.id),
+  );
+  if (unplanned)
+    return {
+      text: "The spec is approved. Open it and choose Propose implementation plan.",
+      open: { kind: "specs", row: unplanned, label: "Open spec" },
+    };
+  const undrafted = intakes.find(
+    (i) => !specs.some((s) => s.intakeId === i.id),
+  );
+  if (undrafted)
+    return {
+      text: "The request is saved. Open it and choose Draft specification from intake.",
+      open: { kind: "intakes", row: undrafted, label: "Open request" },
+    };
+  if (
+    executions.some((e) =>
+      ["running", "queued", "starting"].includes(status(e)),
+    )
+  )
+    return {
+      text: "A run is in progress. Watch it in Pipeline.",
+      page: "pipeline",
+    };
+  return null;
+}
+
+/** A plan is named after its specification: "Plan v1: <spec title>". */
+export function planTitle(plan: R, specs: R[]): string {
+  const spec = specs.find((s) => s.id === plan.specId);
+  const name = spec?.title ?? spec?.body?.title;
+  return name
+    ? `Plan v${plan.version ?? 1}: ${name}`
+    : `Plan v${plan.version ?? 1}`;
+}
+
+/** Statuses of a run that stopped and can be restarted from where it stopped. */
+const STOPPED = [
+  "failed",
+  "cancelled",
+  "awaiting_human",
+  "blocked",
+  "replan_requested",
+];
+
+/** Why a run waits or stopped, task by task, in words (empty when nothing is wrong). */
+export function stopReasons(
+  view: R | undefined,
+): { task: string; text: string }[] {
+  const out: { task: string; text: string }[] = [];
+  for (const t of view?.tasks ?? []) {
+    const blocked = String(t.blockedReason ?? "");
+    if (blocked.startsWith("agent_unavailable")) {
+      const until = /until (\S+)/.exec(blocked)?.[1];
+      const at = until ? new Date(until) : null;
+      out.push({
+        task: t.planTaskId,
+        text: `Waiting for its agent, which reported a usage limit or a login problem. It runs again${
+          at && !Number.isNaN(at.getTime())
+            ? ` at ${at.toLocaleString("en-US", { weekday: "short", hour: "numeric", minute: "2-digit" })}`
+            : " once the agent can work"
+        }, or sooner on the fallback agent.`,
+      });
+    } else if (t.escalation) {
+      out.push({
+        task: t.planTaskId,
+        text: `Stopped: ${t.escalationReason ?? "it needs a decision"}.`,
+      });
+    } else if (t.status === "failed") {
+      out.push({ task: t.planTaskId, text: "Failed." });
+    }
+  }
+  return out;
+}
+
+/** Why the run cannot be restarted now; "" when it can. */
+export function restartBlock(status: unknown): string {
+  return STOPPED.includes(String(status ?? ""))
+    ? ""
+    : status === "verified_pending_review"
+      ? "This run finished. Start the plan again to run it anew."
+      : "Only a run that stopped can be restarted.";
+}
+
+/**
+ * The earlier run a spec or plan revises (a Revise or follow-up of a delivered document), with
+ * that run's title; null for new work. Sindri links the revision's intake to the earlier run.
+ */
+export function revisionOf(
+  record: R,
+  lists: { specs: R[]; plans?: R[]; intakes: R[]; executions: R[]; deliveries?: R[] },
+): { executionId: string; title: string } | null {
+  const spec = record.intakeId
+    ? record
+    : lists.specs.find((s) => s.id === record.specId);
+  const intake = lists.intakes.find((i) => i.id === spec?.intakeId);
+  const executionId = intake?.linkedExecutionId;
+  if (typeof executionId !== "string" || !executionId) return null;
+  const earlier = lists.executions.find((e) => e.execution?.id === executionId);
+  const planId =
+    earlier?.execution?.planId ??
+    lists.deliveries?.find((d) => d.executionId === executionId)?.planId;
+  const plan = earlier?.plan ?? lists.plans?.find((p) => p.id === planId);
+  const title =
+    lists.specs.find((s) => s.id === plan?.specId)?.title ??
+    "an earlier plan";
+  return { executionId, title: String(title) };
+}
+
+/** What a draft or in-review spec or plan on the Human decisions list waits for. */
+export function decisionDetail(
+  kind: "Specification" | "Plan",
+  record: R,
+  revision: { title: string } | null,
+): string {
+  if (revision)
+    return kind === "Plan"
+      ? `Revision of "${revision.title}": approve and start it to run`
+      : `Revision of "${revision.title}": approve it to plan and run the revision`;
+  return record.status === "review"
+    ? "Submitted for review: approve it to continue"
+    : "Waiting for your approval";
+}
+
+/**
+ * How the work behind an In progress record ended, when its run delivered a plan or research
+ * someone decided on: intake → spec → plan → that plan's delivery. Null while undecided.
+ */
+export function recordOutcome(
+  kind: string,
+  row: R,
+  lists: { specs: R[]; plans: R[]; deliveries: R[] },
+): (NonNullable<ReturnType<typeof documentDecision>> & { executionId: string }) | null {
+  const plansOf = (specIds: string[]) =>
+    lists.plans.filter((p) => specIds.includes(p.specId));
+  const plans =
+    kind === "plans"
+      ? [row]
+      : kind === "specs"
+        ? plansOf([row.id])
+        : plansOf(lists.specs.filter((s) => s.intakeId === row.id).map((s) => s.id));
+  for (const plan of plans) {
+    const d = lists.deliveries.find((x) => x.planId === plan.id);
+    const executionId = d ? String(d.executionId ?? d.id) : "";
+    const outcome = d ? documentDecision(lists.deliveries, executionId) : null;
+    if (outcome) return { ...outcome, executionId };
+  }
+  return null;
+}

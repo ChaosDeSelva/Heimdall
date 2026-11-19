@@ -2,6 +2,7 @@
 // plans. Also the plan and specification editors the inspector shows. Sindri validates everything.
 import { useEffect, useState } from "react";
 import {
+  Badge,
   Button,
   Callout,
   Card,
@@ -24,18 +25,29 @@ import {
   Textarea,
 } from "@factory/ui";
 import { useHeimdall } from "../app/context";
-import { LearnMore, Status } from "../components/app";
+import { navigate } from "../lib/router";
+import { IntakeStatus, LearnMore, Status } from "../components/app";
 import type { R } from "../lib/api";
 import { AccessCallout } from "./AccessCallout";
-import { PrReviewForm, ResearchForm, WorkKindBadge } from "./WorkForms";
-import { kindOf } from "./workKinds";
+import {
+  PlanForm,
+  PrReviewForm,
+  ResearchForm,
+  WorkKindBadge,
+} from "./WorkForms";
+import { contextField, kindOf } from "./workKinds";
+import { ContextPicker, useContextDocs } from "./ContextPicker";
 import {
   actionBlock,
   latestVersions,
+  nextStep,
+  planTitle,
+  recordOutcome,
   sameRepo,
   specRevision,
   statusBadge,
 } from "./workflowState";
+import { RunStatus } from "./RunStatus";
 
 const STEPS = [
   { id: "connect", label: "Connect a project" },
@@ -74,7 +86,8 @@ export function NewWorkPage() {
     [project, setProject] = useState(""),
     [request, setRequest] = useState(""),
     [title, setTitle] = useState(""),
-    [workKind, setWorkKind] = useState("change");
+    [workKind, setWorkKind] = useState("change"),
+    [context, setContext] = useContextDocs();
   const sindri: R = state?.sindri ?? {};
   // Sindri's records of the active (not archived) projects; one repository may be registered twice.
   const projects = scope.sindriProjects.filter((p) =>
@@ -117,13 +130,33 @@ export function NewWorkPage() {
     access ||
     noProject ||
     (request.trim() ? "" : "Describe the request first.");
-  const recordsOf = (kind: string): R[] =>
-    (kind === "intakes"
-      ? (sindri[kind] ?? [])
-      : latestVersions(sindri[kind] ?? [])
-    ).filter((r: R) => !project || r.projectId === project);
-  const started = LISTS.some((l) => recordsOf(l.kind).length > 0);
-  const step = !projects.length ? 0 : started ? 2 : 1;
+  // Always a new request: work already under way is on In progress (step 3).
+  const step = projects.length ? 1 : 0;
+  const connectForm = (
+    <Stack gap={4}>
+      <Field label="Project name">
+        <Input value={name} onChange={(e) => setName(e.target.value)} />
+      </Field>
+      <Field label="Absolute repository path">
+        <Input
+          placeholder="/Users/you/Projects/my-app"
+          value={repo}
+          onChange={(e) => setRepo(e.target.value)}
+        />
+      </Field>
+      <Cluster>
+        <Button
+          variant="primary"
+          disabledReason={createWhy || undefined}
+          onClick={() =>
+            propose("project.create", "new", { name, repoPath: repo })
+          }
+        >
+          Review project creation
+        </Button>
+      </Cluster>
+    </Stack>
+  );
 
   return (
     <Page>
@@ -142,36 +175,18 @@ export function NewWorkPage() {
         Unlock operator controls and pair Sindri to create or run work.
       </AccessCallout>
       <Stepper steps={STEPS} current={step} />
-      <CardGroup min={340}>
-        <Card
-          title="Connect a project"
-          term="Project"
-          description="Register an existing local Git repository with Sindri. No remote repository is required."
-        >
-          <Stack gap={4}>
-            <Field label="Project name">
-              <Input value={name} onChange={(e) => setName(e.target.value)} />
-            </Field>
-            <Field label="Absolute repository path">
-              <Input
-                placeholder="/Users/you/Projects/my-app"
-                value={repo}
-                onChange={(e) => setRepo(e.target.value)}
-              />
-            </Field>
-            <Cluster>
-              <Button
-                variant="primary"
-                disabledReason={createWhy || undefined}
-                onClick={() =>
-                  propose("project.create", "new", { name, repoPath: repo })
-                }
-              >
-                Review project creation
-              </Button>
-            </Cluster>
-          </Stack>
-        </Card>
+      <CardGroup min={projects.length ? 640 : 340}>
+        {/* The connect form is the first step only while no project exists; after that it is
+            tucked under "Add a project" so it doesn't compete with describing the work. */}
+        {!projects.length && (
+          <Card
+            title="Connect a project"
+            term="Project"
+            description="Register an existing local Git repository with Sindri. No remote repository is required."
+          >
+            {connectForm}
+          </Card>
+        )}
         <Card title="Describe the work" term="Intake">
           <Stack gap={4}>
             <Field label="Project" term="Project">
@@ -194,7 +209,14 @@ export function NewWorkPage() {
               >
                 Read project context
               </Button>
+              <span className="text-xs text-muted">
+                Optional: indexes the repository so specs and plans can cite it.
+                Run it once per project, and again after large changes.
+              </span>
             </Cluster>
+            {projects.length > 0 && (
+              <Disclosure title="Add a project">{connectForm}</Disclosure>
+            )}
             <SegmentedControl
               label="Kind of work"
               value={workKind}
@@ -203,8 +225,12 @@ export function NewWorkPage() {
                 { value: "change", label: "Change" },
                 { value: "research", label: "Research" },
                 { value: "pr_review", label: "Review a PR" },
+                { value: "proposal", label: "Plan from text" },
               ]}
             />
+            {workKind === "proposal" && (
+              <PlanForm key={project} projectId={project} projects={projects} />
+            )}
             {workKind === "research" && (
               <ResearchForm key={project} projectId={project} />
             )}
@@ -229,6 +255,11 @@ export function NewWorkPage() {
                     placeholder="What should we build? Include outcomes, constraints, and how we can verify success."
                   />
                 </Field>
+                <ContextPicker
+                  id="change-context"
+                  value={context}
+                  onChange={setContext}
+                />
                 <Cluster gap={2}>
                   <Button
                     disabledReason={intakeWhy || undefined}
@@ -237,6 +268,7 @@ export function NewWorkPage() {
                         projectId: project,
                         title,
                         body: request,
+                        ...contextField(context),
                       })
                     }
                   >
@@ -246,10 +278,41 @@ export function NewWorkPage() {
                     variant="primary"
                     disabledReason={draftWhy || undefined}
                     onClick={() =>
-                      propose("spec.draft", "new", {
-                        projectId: project,
-                        request,
-                      })
+                      context.length
+                        ? // Context lives on the request: save it, then draft from it.
+                          propose(
+                            "intake.create",
+                            "new",
+                            {
+                              projectId: project,
+                              title:
+                                title.trim() ||
+                                request.trim().split("\n")[0]!.slice(0, 200),
+                              body: request,
+                              ...contextField(context),
+                              thenDraft: true,
+                            },
+                            {},
+                            {
+                              onSent: () => {
+                                setTitle("");
+                                setRequest("");
+                                setContext([]);
+                              },
+                            },
+                          )
+                        : propose(
+                            "spec.draft",
+                            "new",
+                            { projectId: project, request },
+                            {},
+                            {
+                              onSent: () => {
+                                setTitle("");
+                                setRequest("");
+                              },
+                            },
+                          )
                     }
                   >
                     Draft specification
@@ -260,67 +323,166 @@ export function NewWorkPage() {
           </Stack>
         </Card>
       </CardGroup>
-      <Card
-        title="Review, plan, execute"
-        description="Open a specification to answer questions or revise it, submit it for review and approve it. Propose a plan, adjust priorities and budgets, approve the revision, then start the run."
-      >
-        <CardGroup min={280}>
-          {LISTS.map((list) => {
-            const records = recordsOf(list.kind);
-            return (
-              <Card
-                key={list.kind}
-                title={list.title}
-                term={list.term}
-                count={records.length}
-                headingLevel={3}
-                flush
-              >
-                {records.length ? (
-                  <RecordList label={list.title}>
-                    {records.map((r) => (
-                      <RecordRow
-                        key={r.id}
-                        title={r.title ?? `Plan v${r.version}`}
-                        meta={`${list.kind === "specs" && r.version != null ? `v${r.version} · ` : ""}${r.id}`}
-                        status={
-                          <span className="flex flex-wrap items-center gap-2">
-                            {list.kind !== "specs" && (
-                              <WorkKindBadge
-                                kind={kindOf(r, sindri.plans ?? [])}
-                              />
-                            )}
-                            {statusBadge(list.kind, r) && (
+    </Page>
+  );
+}
+
+/**
+ * Top-bar page: the selected project's work between request and run (or every active project's
+ * under All projects). Saving a request or finishing a draft lands here.
+ */
+export function InProgressPage() {
+  const { state, scope, open, projectName, href, pending } = useHeimdall();
+  const sindri: R = state?.sindri ?? {};
+  const inScope = (r: R) =>
+    scope.filter === "all"
+      ? scope.sindriProjects.some((p) => p.id === r.projectId)
+      : scope.sindriIds.has(r.projectId);
+  const recordsOf = (kind: string): R[] =>
+    (kind === "intakes"
+      ? (sindri[kind] ?? [])
+      : latestVersions(sindri[kind] ?? [])
+    ).filter(inScope);
+  const next = nextStep({
+    intakes: recordsOf("intakes"),
+    specs: recordsOf("specs"),
+    plans: recordsOf("plans"),
+    deliveries: (sindri.deliveries ?? []).filter(inScope),
+    removed: (sindri.removedExecutions ?? []).filter(inScope),
+    executions: (sindri.executions ?? []).filter((e: R) =>
+      inScope({ projectId: e.execution?.projectId ?? e.plan?.projectId }),
+    ),
+  });
+  // A record whose work ended in a decided plan or research shows that, not "approved".
+  const outcome = (kind: string, r: R) =>
+    recordOutcome(kind, r, {
+      specs: sindri.specs ?? [],
+      plans: sindri.plans ?? [],
+      deliveries: sindri.deliveries ?? [],
+    });
+  return (
+    <Page>
+      <PageHeader
+        title="In progress"
+        description="Open a record to act on it: draft and approve its specification, propose and approve a plan, then start the run."
+        learnMore={<LearnMore screen="in-progress" />}
+        scope={{ project: projectName }}
+      />
+      <AccessCallout pairing>
+        Unlock operator controls and pair Sindri to review or start work.
+      </AccessCallout>
+      <Stepper steps={STEPS} current={2} />
+      {pending.length > 0 ? (
+        // Work already running is the next step: following the record's own next step now
+        // would start it a second time.
+        <Callout tone="info" title="Working">
+          {pending.map((p) => p.label).join(", ")}: an agent is reading the
+          repository. The result appears here when it is ready; this usually
+          takes a few minutes.
+        </Callout>
+      ) : (
+        next && (
+          <Callout tone="info" title="Next step">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <span>{next.text}</span>
+              {next.open ? (
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={() => open(next.open!.kind, next.open!.row)}
+                >
+                  {next.open.label}
+                </Button>
+              ) : next.page ? (
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={() => navigate(href(next.page!))}
+                >
+                  {next.page === "pipeline"
+                    ? "Open Pipeline"
+                    : "Open Quality & approvals"}
+                </Button>
+              ) : null}
+            </div>
+          </Callout>
+        )
+      )}
+      <CardGroup min={280}>
+        {LISTS.map((list) => {
+          const records = recordsOf(list.kind);
+          return (
+            <Card
+              key={list.kind}
+              title={list.title}
+              term={list.term}
+              count={records.length}
+              headingLevel={3}
+              flush
+            >
+              {records.length ? (
+                <RecordList label={list.title}>
+                  {records.map((r) => (
+                    <RecordRow
+                      key={r.id}
+                      title={r.title ?? planTitle(r, sindri.specs ?? [])}
+                      meta={`${list.kind === "specs" && r.version != null ? `v${r.version} · ` : ""}${r.id}`}
+                      status={
+                        <span className="flex flex-wrap items-center gap-2">
+                          {list.kind !== "specs" && (
+                            <WorkKindBadge
+                              kind={kindOf(r, sindri.plans ?? [])}
+                            />
+                          )}
+                          {list.kind === "plans" &&
+                          !outcome(list.kind, r) &&
+                          (sindri.removedExecutions ?? []).some(
+                            (e: R) => e.planId === r.id,
+                          ) ? (
+                            <Badge tone="neutral">Run removed</Badge>
+                          ) : outcome(list.kind, r) ? (
+                            <RunStatus
+                              execution={{ id: outcome(list.kind, r)!.executionId }}
+                              deliveries={sindri.deliveries ?? []}
+                            />
+                          ) : list.kind === "intakes" ? (
+                            <IntakeStatus
+                              row={r}
+                              specs={sindri.specs ?? []}
+                              size="sm"
+                            />
+                          ) : (
+                            statusBadge(list.kind, r) && (
                               <Status
                                 value={statusBadge(list.kind, r)}
                                 domain={list.domain}
                                 size="sm"
                                 tooltip={false}
                               />
-                            )}
-                          </span>
-                        }
-                        onClick={() => open(list.kind, r)}
-                      />
-                    ))}
-                  </RecordList>
-                ) : (
-                  <EmptyState
-                    compact
-                    className="m-4"
-                    title={list.empty}
-                    body={
-                      list.kind === "plans"
-                        ? "Approve a specification, then propose a plan from it."
-                        : "Describe the work above to start one."
-                    }
-                  />
-                )}
-              </Card>
-            );
-          })}
-        </CardGroup>
-      </Card>
+                            )
+                          )}
+                        </span>
+                      }
+                      onClick={() => open(list.kind, r)}
+                    />
+                  ))}
+                </RecordList>
+              ) : (
+                <EmptyState
+                  compact
+                  className="m-4"
+                  title={list.empty}
+                  body={
+                    list.kind === "plans"
+                      ? "Approve a specification, then propose a plan from it."
+                      : "Use New work to describe a request."
+                  }
+                />
+              )}
+            </Card>
+          );
+        })}
+      </CardGroup>
     </Page>
   );
 }

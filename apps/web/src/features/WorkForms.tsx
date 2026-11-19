@@ -5,6 +5,7 @@ import {
   Button,
   Callout,
   Checkbox,
+  Disclosure,
   Field,
   Input,
   Select,
@@ -18,7 +19,12 @@ import { Reasons } from "../components/app";
 import type { R } from "../lib/api";
 import {
   PR_URL,
+  PLAN_REFERENCES_MAX,
+  PLAN_TEXT_MAX_CHARS,
   REQUEST_NOTES_MAX_BYTES,
+  detectProjects,
+  planBlock,
+  planBody,
   kindBadge,
   lessonsLinked,
   localOnlyOf,
@@ -27,10 +33,12 @@ import {
   projectCandidates,
   researchBlock,
   researchBody,
+  contextField,
   utf8Bytes,
   webSourceBlock,
 } from "./workKinds";
 import { actionBlock } from "./workflowState";
+import { ContextPicker, useContextDocs } from "./ContextPicker";
 
 type Load<T> =
   | { status: "loading" }
@@ -206,7 +214,8 @@ export function ResearchForm({ projectId }: { projectId: string }) {
     [web, setWeb] = useState(false),
     [factCheck, setFactCheck] = useState(true),
     [notes, setNotes] = useState(""),
-    [skillIds, setSkillIds] = useState<string[]>([]);
+    [skillIds, setSkillIds] = useState<string[]>([]),
+    [context, setContext] = useContextDocs();
   const lessonsTouched = useRef(false);
   useEffect(() => {
     if (!lessonsTouched.current) setLessons(linked);
@@ -231,9 +240,13 @@ export function ResearchForm({ projectId }: { projectId: string }) {
       <Field label="Question">
         <Input value={question} onChange={(e) => setQuestion(e.target.value)} />
       </Field>
-      <Field label="Background (optional)">
+      <Field
+        label="Background (optional)"
+        hint={`Paste anything the agent should read: a call transcript, notes, a ticket. ${background.length.toLocaleString("en-US")} characters.`}
+      >
         <Textarea
           value={background}
+          rows={8}
           onChange={(e) => setBackground(e.target.value)}
         />
       </Field>
@@ -298,6 +311,7 @@ export function ResearchForm({ projectId }: { projectId: string }) {
         onChange={setSkillIds}
         hint="Each selected skill's SKILL.md is given to the agent as guidance."
       />
+      <ContextPicker id="research-context" value={context} onChange={setContext} />
       <div>
         <Button
           variant="primary"
@@ -306,20 +320,28 @@ export function ResearchForm({ projectId }: { projectId: string }) {
             propose(
               "intake.create",
               "new",
-              researchBody(input),
+              // Saved and drafted in one step; the spec is then approved and planned in one.
+              { ...researchBody(input), ...contextField(context), thenDraft: true },
               {},
               {
-                onSuccess: () => {
+                onSent: () => {
                   setQuestion("");
                   setBackground("");
                   setNotes("");
                   setSkillIds([]);
                 },
+                onSuccess: () => {
+                  setQuestion("");
+                  setBackground("");
+                  setNotes("");
+                  setSkillIds([]);
+                  setContext([]);
+                },
               },
             )
           }
         >
-          Review research question
+          Save and draft spec
         </Button>
       </div>
       <Reasons reasons={[why]} />
@@ -334,6 +356,7 @@ export function PrReviewForm({ projectId }: { projectId: string }) {
   const [url, setUrl] = useState(""),
     [notes, setNotes] = useState(""),
     [skillIds, setSkillIds] = useState<string[]>([]),
+    [context, setContext] = useContextDocs(),
     [candidates, setCandidates] = useState<
       { id: string; name: string }[] | null
     >(null),
@@ -406,6 +429,7 @@ export function PrReviewForm({ projectId }: { projectId: string }) {
         }}
         hint="Pre-selected with the project's default review skills."
       />
+      <ContextPicker id="pr-context" value={context} onChange={setContext} />
       <div>
         <Button
           variant="primary"
@@ -414,12 +438,13 @@ export function PrReviewForm({ projectId }: { projectId: string }) {
             propose(
               "intake.import",
               "new",
-              prReviewBody(input),
+              { ...prReviewBody(input), ...contextField(context) },
               {},
               {
                 onSuccess: () => {
                   setUrl("");
                   setNotes("");
+                  setContext([]);
                   setCandidates(null);
                   setPick("");
                 },
@@ -444,6 +469,183 @@ export function PrReviewForm({ projectId }: { projectId: string }) {
             : "Review pull request import"}
         </Button>
       </div>
+      <Reasons reasons={[why]} />
+    </Stack>
+  );
+}
+
+/**
+ * A plan from pasted text: the factory researches each project the text names (the operator
+ * confirms which), then writes a readable proposal and an engineering appendix.
+ */
+export function PlanForm({
+  projectId,
+  projects,
+}: {
+  projectId: string;
+  projects: R[];
+}) {
+  const { session, propose } = useHeimdall();
+  const skills = useSkills();
+  const github = useDetail<boolean>("details/github-status", localOnlyOf);
+  const localOnly = github.status === "ready" && github.data;
+  const [text, setText] = useState(""),
+    [title, setTitle] = useState(""),
+    [web, setWeb] = useState(false),
+    [factCheck, setFactCheck] = useState(true),
+    [notes, setNotes] = useState(""),
+    [skillIds, setSkillIds] = useState<string[]>([]),
+    [context, setContext] = useContextDocs(),
+    // Projects the operator ticked or unticked by hand win over detection.
+    [picked, setPicked] = useState<Record<string, boolean>>({});
+  const others = projects.filter((p) => p.id !== projectId);
+  const detected = detectProjects(text, others);
+  const isDetected = (id: string) => detected.some((d) => d.projectId === id);
+  const ticked = (id: string) =>
+    picked[id] ?? detected.some((d) => d.projectId === id && !d.weak);
+  const referenceProjectIds = others
+    .map((p) => String(p.id))
+    .filter((id) => ticked(id));
+  const input = {
+    projectId,
+    title,
+    text,
+    referenceProjectIds,
+    web,
+    localOnly,
+    factCheck,
+    notes,
+    skillIds,
+  };
+  const why =
+    actionBlock("intake.create", undefined, session) || planBlock(input);
+  const clear = () => {
+    setText("");
+    setTitle("");
+    setNotes("");
+    setSkillIds([]);
+    setContext([]);
+    setPicked({});
+  };
+  const projectBox = (p: R) => {
+    const d = detected.find((x) => x.projectId === p.id);
+    return (
+      <li key={p.id}>
+        <Checkbox
+          id={`plan-project-${p.id}`}
+          checked={ticked(String(p.id))}
+          onChange={(e) =>
+            setPicked((old) => ({ ...old, [String(p.id)]: e.target.checked }))
+          }
+          label={<span className="font-medium">{p.name ?? p.id}</span>}
+          description={
+            d
+              ? `Named ${d.mentions === 1 ? "once" : `${d.mentions} times`} in the text${d.weak ? ", but only by an everyday word: tick it if the text means this project" : ""}.`
+              : undefined
+          }
+        />
+      </li>
+    );
+  };
+  return (
+    <Stack gap={4}>
+      <Field
+        label="Text to plan from"
+        hint={`Paste a call transcript, notes or a brief. ${text.length.toLocaleString("en-US")} of ${PLAN_TEXT_MAX_CHARS.toLocaleString("en-US")} characters.`}
+      >
+        <Textarea
+          value={text}
+          rows={14}
+          onChange={(e) => setText(e.target.value)}
+        />
+      </Field>
+      <Field label="Title (optional)" hint="Defaults to the text's first line.">
+        <Input value={title} onChange={(e) => setTitle(e.target.value)} />
+      </Field>
+      <fieldset
+        className="flex min-w-0 flex-col gap-2"
+        aria-describedby="plan-projects-hint"
+      >
+        <legend className="mb-1 text-sm font-medium text-fg">
+          Other projects to read
+        </legend>
+        <p id="plan-projects-hint" className="text-xs text-muted">
+          The plan belongs to the project chosen above, and its code is always
+          read. Each project ticked here is researched too, in parallel, from a
+          read-only copy. Up to {PLAN_REFERENCES_MAX}.
+        </p>
+        {detected.length > 0 ? (
+          <ul className="flex flex-col gap-2">
+            {others.filter((p) => isDetected(String(p.id))).map(projectBox)}
+          </ul>
+        ) : (
+          <p className="text-sm text-muted">
+            {text.trim()
+              ? "The text names no other project."
+              : "Projects the text names will appear here."}
+          </p>
+        )}
+        {others.some((p) => !isDetected(String(p.id))) && (
+          <Disclosure title="Add another project">
+            <ul className="flex flex-col gap-2">
+              {others.filter((p) => !isDetected(String(p.id))).map(projectBox)}
+            </ul>
+          </Disclosure>
+        )}
+      </fieldset>
+      <Checkbox
+        id="plan-src-web"
+        label="Let the research use the web"
+        checked={web && !localOnly}
+        disabled={localOnly}
+        onChange={(e) => setWeb(e.target.checked)}
+        description={
+          webSourceBlock(localOnly) ||
+          "Public web pages, for libraries and services the projects use."
+        }
+      />
+      <Switch
+        id="plan-fact-check"
+        label="Fact-check the plan"
+        description="A second agent checks the appendix against the code and that the proposal claims nothing it doesn't support."
+        checked={factCheck}
+        onCheckedChange={setFactCheck}
+      />
+      <NotesField
+        value={notes}
+        onChange={setNotes}
+        hint="Extra guidance for this plan only, such as dates or who it is for."
+      />
+      <SkillPicker
+        id="plan-skills"
+        state={skills}
+        value={skillIds}
+        onChange={setSkillIds}
+        hint="Each selected skill's SKILL.md is given to the agents as guidance."
+      />
+      <ContextPicker id="plan-context" value={context} onChange={setContext} />
+      <div>
+        <Button
+          variant="primary"
+          disabledReason={why || undefined}
+          onClick={() =>
+            propose(
+              "intake.create",
+              "new",
+              { ...planBody(input), ...contextField(context), thenDraft: true },
+              {},
+              { onSent: clear, onSuccess: clear },
+            )
+          }
+        >
+          Save and draft spec
+        </Button>
+      </div>
+      <p className="text-xs text-muted">
+        After the spec is approved, the plan researches every ticked project,
+        then writes the proposal (sections, tickets with Ticket 0 as a spike, a
+        week-by-week demo plan and diagrams) and its engineering appendix.
+      </p>
       <Reasons reasons={[why]} />
     </Stack>
   );

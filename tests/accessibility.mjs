@@ -31,8 +31,10 @@ const PAGES = [
   ["/graph", "Execution graph"],
   ["/activity", "Activity"],
   ["/quality", "Quality & approvals"],
+  ["/documents", "Documents"],
   ["/autonomy", "Autonomy"],
   ["/new-work", "New work"],
+  ["/in-progress", "In progress"],
   ["/notifications", "Notifications"],
   ["/projects", "Projects"],
   ["/connections/services", "Connections"],
@@ -55,9 +57,73 @@ const delivery = (id, region) => async () => {
   await page.getByRole("dialog").getByRole("region", { name: region }).waitFor();
 };
 const WORK_STATES = [
-  ["New work: research", kindForm("Research", "Review research question")],
+  ["New work: research", kindForm("Research", "Save and draft spec")],
   ["New work: PR review", kindForm("Review a PR", "Review pull request import")],
   ["Inspector: research document", delivery("exe_research", "Research document")],
+  ["New work: plan from text", kindForm("Plan from text", "Save and draft spec")],
+  ["Inspector: plan", async () => {
+    await delivery("exe_plan", "Plan")();
+    const plan = page.getByRole("dialog");
+    await plan.getByLabel("Diagram").first().waitFor();
+    // A fact-check that asked for changes says what to do next, where the plan is read.
+    await plan.getByText("The fact-check asked for changes", { exact: true }).waitFor();
+    await plan.getByText(/1 major · 1 minor/).first().waitFor();
+    await plan.getByLabel("What to change").waitFor();
+    assert.equal(await plan.getByRole("button", { name: "Re-run quality checks" }).count(), 0);
+    // The way out of a fact-check that keeps asking: accept over it, with a reason.
+    assert.equal(await plan.getByRole("button", { name: "Accept over the fact-check" }).count(), 1);
+    assert.equal(await plan.getByRole("button", { name: "Accept plan" }).count(), 0);
+    await plan.getByRole("tab", { name: /Fact-check/ }).click();
+    const facts = plan.getByRole("list", { name: "Fact-check findings" });
+    await facts.getByText("The Sources list skips [2]").waitFor();
+    // The run's input folders are dropped from the location, and the fix reads apart.
+    await facts.getByText("proposal.md:12", { exact: true }).waitFor();
+    await facts.getByText("move the export to week 2.").waitFor();
+  }],
+  ["Documents: use an accepted plan as context", async () => {
+    await page.goto(app.url + "/documents");
+    const table = page.getByRole("table", { name: "Accepted documents" });
+    await table.getByText("Accepted config plan").waitFor();
+    // A plan with no decision is not in the library.
+    assert.equal(await table.getByText("Plan for proposal").count(), 0);
+    // A version a decided revision replaced shows only with the switch, and never waits.
+    assert.equal(await table.getByText("Replaced config plan").count(), 0);
+    await page.getByLabel("Show rejected and replaced").check();
+    await table.getByText("Replaced config plan").waitFor();
+    await table.getByText("Replaced by a revision").waitFor();
+    await page.getByLabel("Show rejected and replaced").uncheck();
+    await page.getByRole("table", { name: "Uploaded files" }).getByText("call-notes.md").waitFor();
+    await table.getByRole("button", { name: "Use as context" }).click();
+    await page.waitForURL(/\/new-work\?.*context=exe_accepted/);
+    const picked = page.getByRole("checkbox", { name: /Accepted config plan/ });
+    await picked.waitFor();
+    assert.equal(await picked.isChecked(), true);
+    // Uploaded files are offered too.
+    await page.getByRole("checkbox", { name: /call-notes\.md/ }).waitFor();
+  }],
+  ["Quality: a replaced plan does not wait", async () => {
+    await page.goto(app.url + "/quality?project=prj_demo");
+    const docs = page.getByRole("table", { name: "Documents and reviews" });
+    await docs.waitFor();
+    await page.waitForTimeout(500);
+    assert.equal(await docs.getByText("Replaced config plan").count(), 0);
+  }],
+  ["Overview: results", async () => {
+    await page.goto(app.url + "/?project=prj_demo");
+    const list = page.getByRole("list", { name: "Results" });
+    await list.getByText("Accepted config plan").waitFor();
+    assert.match(await list.innerText(), /Plan accepted/);
+    assert.equal(await list.getByText("Replaced config plan").count(), 0);
+  }],
+  ["Inspector: plan revision", async () => {
+    await page.goto(app.url + "/quality?project=prj_demo");
+    const row = page.getByText('Revision of "Config plan": approve it to plan and run the revision');
+    await row.waitFor();
+    await page.goto(app.url + "/quality?project=prj_demo&inspect=specs:spc_revision");
+    const spec = page.getByRole("dialog");
+    await spec.getByText("This is a revision", { exact: true }).waitFor();
+    await spec.getByRole("button", { name: "Approve, plan and start" }).waitFor();
+  }],
   ["Inspector: PR review", async () => {
     await delivery("exe_review", "Leak check")();
     await page.getByRole("dialog").getByText("Posting is blocked").waitFor();

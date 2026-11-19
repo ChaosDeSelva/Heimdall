@@ -3,7 +3,12 @@
 type R = Record<string, any>;
 
 /** The work kinds this UI labels; checked against @factory/docs in a test. */
-export const WORK_KINDS = ["change", "research", "pr_review"] as const;
+export const WORK_KINDS = [
+  "change",
+  "research",
+  "pr_review",
+  "proposal",
+] as const;
 export type WorkKind = (typeof WORK_KINDS)[number];
 /** Decisions a research document can carry; checked against @factory/docs in a test. */
 export const RESEARCH_DECISIONS = ["accepted", "rejected"] as const;
@@ -30,6 +35,11 @@ const LABELS: Record<
     text: "PR review",
     tone: "forest",
     hint: "A local review of a GitHub pull request",
+  },
+  proposal: {
+    text: "Plan",
+    tone: "accent",
+    hint: "A proposal and engineering appendix planned from pasted text",
   },
 };
 
@@ -337,6 +347,50 @@ export interface WorkSummary {
   posted?: boolean;
   verdict?: string | null;
   gatePassed?: boolean;
+  /** The checks failed only because the reviewer asked for changes (nothing broke). */
+  changesRequested?: boolean;
+  decidedAt?: string | null;
+  decidedBy?: string | null;
+  /** Plans: the run of a later revision someone decided on; this version waits for nothing. */
+  replacedBy?: string | null;
+}
+
+/**
+ * A gate's result for its badge: a gate that failed only because the reviewer asked for changes
+ * is `request_changes` ("Changes requested"), not `failed`.
+ */
+export function gateResult(g: {
+  passed?: unknown;
+  failures?: unknown;
+}): "passed" | "request_changes" | "failed" {
+  if (g.passed === true) return "passed";
+  const failures = Array.isArray(g.failures) ? g.failures : [];
+  const reason = (f: unknown) =>
+    String(typeof f === "string" ? f : ((f as R | null)?.reason ?? "")).split(
+      ":",
+    )[0];
+  return failures.length > 0 &&
+    failures.every((f) => reason(f) === "review_request_changes")
+    ? "request_changes"
+    : "failed";
+}
+
+/** "2 major · 5 minor · 5 info": a findings list by severity, most severe first. */
+export function findingCounts(findings: unknown): string {
+  const order = ["blocking", "critical", "major", "minor", "info"];
+  const n = new Map<string, number>();
+  for (const f of Array.isArray(findings) ? findings : [])
+    if (f && typeof f === "object") {
+      const s = String((f as R).severity ?? "info");
+      n.set(s, (n.get(s) ?? 0) + 1);
+    }
+  return [...n]
+    .sort(([a], [b]) => {
+      const i = (s: string) => (order.includes(s) ? order.indexOf(s) : 99);
+      return i(a) - i(b);
+    })
+    .map(([s, c]) => `${c} ${s}`)
+    .join(" · ");
 }
 
 /** Sindri accepts a document only when every gate reported passed; a missing result has not. */
@@ -348,7 +402,8 @@ export const researchChecksPassed = (research: R | null | undefined): boolean =>
 export function pendingDocuments(deliveries: R[]): R[] {
   return deliveries.filter((d) => {
     const w: WorkSummary | undefined = d.work;
-    if (w?.kind === "research") return !w.decision;
+    if (w?.kind === "research" || w?.kind === "proposal")
+      return !w.decision && !w.replacedBy;
     if (w?.kind === "pr_review") return !w.posted;
     return false;
   });
@@ -359,7 +414,15 @@ export function documentWaiting(work: WorkSummary | null | undefined): string {
   if (work?.kind === "research")
     return work.gatePassed === true
       ? "Accept or reject"
-      : "Reject or ask a follow-up (checks failed)";
+      : work.changesRequested
+        ? "Reject or ask a follow-up (fact-check asked for changes)"
+        : "Reject or ask a follow-up (checks failed)";
+  if (work?.kind === "proposal")
+    return work.gatePassed === true
+      ? "Accept, reject or revise"
+      : work.changesRequested
+        ? "Reject or revise (fact-check asked for changes)"
+        : "Reject or revise (checks failed)";
   return `Posting in Sindri · ${verdictLabel(work?.verdict)}`;
 }
 
@@ -381,4 +444,268 @@ export function commandErrorText(e: {
   if (e.code === "pr_changed_since_plan")
     return `The pull request changed since this review was planned (planned at ${shortSha(d.planHead)}, now at ${shortSha(d.currentHead)}). Import the pull request again to review the new commits.`;
   return e.message;
+}
+
+/** Sindri's limits on a plan request (MAX_PROPOSAL_TEXT_CHARS, MAX_PROPOSAL_REFERENCES). */
+export const PLAN_TEXT_MAX_CHARS = 200_000;
+export const PLAN_REFERENCES_MAX = 8;
+
+export interface DetectedProject {
+  projectId: string;
+  name: string;
+  mentions: number;
+  /** Named only by an everyday word ("frontend"), so suggested rather than assumed. */
+  weak: boolean;
+}
+
+/** Single words as likely to mean the thing as the project (Sindri's detect-projects GENERIC). */
+const GENERIC = new Set(
+  (
+    "admin api app apps backend cli client common core dashboard data docs frontend infra " +
+    "infrastructure internal lib mobile platform scripts sdk server service shared site tools " +
+    "ui utils web website worker"
+  ).split(" "),
+);
+const nameWords = (name: string) =>
+  name
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .split(/[\s\-_.]+/)
+    .map((w) => w.toLowerCase())
+    .filter(Boolean);
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const folderOf = (path: unknown) =>
+  typeof path === "string"
+    ? (path.split("/").filter(Boolean).at(-1) ?? "")
+    : "";
+
+/**
+ * Which projects a pasted text names, by name, folder or alias, most mentioned first. The same
+ * rules as Sindri's `detectProjects` (packages/intake/src/detect-projects.ts); suggestions only.
+ */
+export function detectProjects(text: string, projects: R[]): DetectedProject[] {
+  const found: (DetectedProject & { first: number })[] = [];
+  for (const p of projects) {
+    const aliases: unknown = p.settings?.aliases ?? p.aliases;
+    const terms = [
+      ...new Set(
+        [
+          p.name,
+          folderOf(p.repoPath),
+          ...(Array.isArray(aliases) ? aliases : []),
+        ].filter((t): t is string => typeof t === "string" && t.length > 0),
+      ),
+    ];
+    const positions = new Set<number>();
+    let weak = true;
+    for (const term of terms) {
+      const parts = nameWords(term);
+      if (parts.join("").length < 3) continue;
+      const re = new RegExp(
+        `\\b${parts.map(escapeRe).join("[\\s\\-_]?")}\\b`,
+        "gi",
+      );
+      let hit = false;
+      for (const m of text.matchAll(re)) {
+        positions.add(m.index ?? 0);
+        hit = true;
+      }
+      if (hit && !(parts.length === 1 && GENERIC.has(parts[0]!))) weak = false;
+    }
+    if (positions.size)
+      found.push({
+        projectId: String(p.id),
+        name: String(p.name ?? p.id),
+        mentions: positions.size,
+        weak,
+        first: Math.min(...positions),
+      });
+  }
+  return found
+    .sort((a, b) => b.mentions - a.mentions || a.first - b.first)
+    .map(({ first: _first, ...d }) => d);
+}
+
+export interface PlanInput {
+  /** The request's own project (where the plan lives). */
+  projectId: string;
+  title: string;
+  text: string;
+  /** Other projects the plan reads, besides the request's own. */
+  referenceProjectIds: string[];
+  web: boolean;
+  localOnly?: boolean;
+  factCheck: boolean;
+  notes: string;
+  skillIds: string[];
+}
+
+/** Why the plan form cannot be sent yet; "" when it can. */
+export function planBlock(f: PlanInput): string {
+  if (!f.projectId) return "Choose the project the plan belongs to.";
+  if (!f.text.trim()) return "Paste the text to plan from.";
+  if (f.text.length > PLAN_TEXT_MAX_CHARS)
+    return `The text is ${f.text.length.toLocaleString("en-US")} characters; the limit is ${PLAN_TEXT_MAX_CHARS.toLocaleString("en-US")}.`;
+  if (f.title.trim().length > QUESTION_MAX_CHARS)
+    return `Keep the title to ${QUESTION_MAX_CHARS} characters.`;
+  const others = f.referenceProjectIds.filter((id) => id !== f.projectId);
+  if (others.length > PLAN_REFERENCES_MAX)
+    return `Choose at most ${PLAN_REFERENCES_MAX} other projects (${others.length} selected).`;
+  if (utf8Bytes(f.notes) > REQUEST_NOTES_MAX_BYTES)
+    return "Notes are too long.";
+  return tooManySkills(f.skillIds);
+}
+
+/** The first non-empty line of the text, as a title when none is given. */
+export const planTitleOf = (f: Pick<PlanInput, "title" | "text">): string =>
+  f.title.trim() ||
+  (
+    f.text
+      .split("\n")
+      .map((l) => l.trim())
+      .find(Boolean) ?? "Plan"
+  ).slice(0, 120);
+
+export function planBody(f: PlanInput): R {
+  return {
+    projectId: f.projectId,
+    title: planTitleOf(f),
+    body: f.text,
+    workKind: "proposal",
+    proposal: {
+      referenceProjectIds: [...new Set(f.referenceProjectIds)].filter(
+        (id) => id !== f.projectId,
+      ),
+      sources: { code: true, web: f.web && !f.localOnly },
+      factCheck: f.factCheck,
+    },
+    ...guidance(f.notes, f.skillIds),
+  };
+}
+
+/** A finding's problem and its "Fix:" (when it ends with one), so the fix reads apart. */
+export function findingParts(message: string): { problem: string; fix: string | null } {
+  const m = /^([\s\S]*?\S)\s*\bFix:\s*([\s\S]+)$/.exec(message.trim());
+  return m ? { problem: m[1]!, fix: m[2]!.trim() } : { problem: message.trim(), fix: null };
+}
+
+/**
+ * Where a finding points, short enough for a chip: the file name and line, without the run's
+ * `.mimir/inputs/...` folders. `full` keeps the whole path for a tooltip.
+ */
+export function shortLocation(f: {
+  file?: string | undefined;
+  line?: number | undefined;
+  placement?: string | undefined;
+}): { short: string; full: string } | null {
+  if (f.placement === "general" || !f.file) return null;
+  const line = f.line != null ? `:${f.line}` : "";
+  const name = f.file.split("/").filter(Boolean).pop() ?? f.file;
+  return { short: `${name}${line}`, full: `${f.file}${line}` };
+}
+
+/**
+ * A run's document decision, when it delivered a plan or research document someone decided on:
+ * the run itself stays `verified_pending_review`, but nothing waits on it any more.
+ */
+export function documentDecision(
+  deliveries: R[],
+  executionId: string,
+): {
+  kind: "research" | "proposal";
+  decision: "accepted" | "rejected" | "replaced";
+  replacedBy?: string;
+} | null {
+  const d = deliveries.find((x) => (x.executionId ?? x.id) === executionId);
+  const w: WorkSummary | undefined = d?.work;
+  if (w?.kind !== "research" && w?.kind !== "proposal") return null;
+  if (w.decision === "accepted" || w.decision === "rejected")
+    return { kind: w.kind, decision: w.decision };
+  if (w.replacedBy) return { kind: w.kind, decision: "replaced", replacedBy: w.replacedBy };
+  return null;
+}
+
+/** Most a request may carry as context (Sindri's limit). */
+export const MAX_CONTEXT_DOCUMENTS = 5;
+
+/**
+ * Plans and research documents with a decision, newest decision first: accepted ones, and with
+ * `rejected` the rejected ones too. Each row is a deliveries list row (`executionId`, `work`).
+ */
+export function decidedDocuments(deliveries: R[], { rejected = false } = {}): R[] {
+  return deliveries
+    .filter((d) => {
+      const w: WorkSummary | undefined = d.work;
+      return (
+        (w?.kind === "research" || w?.kind === "proposal") &&
+        (w.decision === "accepted" ||
+          (rejected && (w.decision === "rejected" || (!w.decision && !!w.replacedBy))))
+      );
+    })
+    .sort((a, b) =>
+      String(b.work?.decidedAt ?? "").localeCompare(String(a.work?.decidedAt ?? "")),
+    );
+}
+
+/** The `?context=` runs a link to New work preselects (comma-separated), at most the limit. */
+export function contextFromQuery(search: string): string[] {
+  const raw = new URLSearchParams(search).get("context") ?? "";
+  return [...new Set(raw.split(",").filter((id) => /^(?:file:)?[\w-]{1,200}$/.test(id)))].slice(
+    0,
+    MAX_CONTEXT_DOCUMENTS,
+  );
+}
+
+/**
+ * The request fields for chosen context: accepted documents by run, and uploaded files
+ * (`file:<id>`). Nothing when none are chosen; at most the limit together.
+ */
+export function contextField(ids: string[]): R {
+  const chosen = ids.slice(0, MAX_CONTEXT_DOCUMENTS);
+  const files = chosen.filter((id) => id.startsWith("file:")).map((id) => id.slice(5));
+  const runs = chosen.filter((id) => !id.startsWith("file:"));
+  return {
+    ...(runs.length ? { contextExecutionIds: runs } : {}),
+    ...(files.length ? { contextFileIds: files } : {}),
+  };
+}
+
+/** A finished piece of work for Overview's Results: what it was, how it ended, and when. */
+export interface Result {
+  executionId: string;
+  kind: string;
+  title: string | null;
+  outcome: string;
+  tone: "forest" | "info" | "neutral";
+  at: string | null;
+}
+
+/**
+ * Finished work, newest first: accepted plans and research, changes delivered (a PR opened or
+ * merged) and posted PR reviews. Rejected, replaced and undecided work is not a result.
+ */
+export function results(deliveries: R[]): Result[] {
+  const out: Result[] = [];
+  for (const d of deliveries) {
+    const w: (WorkSummary & { postedAt?: string }) | null = d.work ?? null;
+    const executionId = String(d.executionId ?? d.id);
+    const kind = String(w?.kind ?? d.workKind ?? "change");
+    const at = (w?.decidedAt ?? d.updatedAt ?? d.createdAt ?? null) as string | null;
+    const title = w?.title ?? null;
+    if ((kind === "proposal" || kind === "research") && w?.decision === "accepted")
+      out.push({
+        executionId,
+        kind,
+        title,
+        outcome: kind === "proposal" ? "Plan accepted" : "Research accepted",
+        tone: "forest",
+        at,
+      });
+    else if (kind === "pr_review" && w?.posted)
+      out.push({ executionId, kind, title, outcome: "Review posted", tone: "info", at });
+    else if (kind === "change" && d.status === "delivered")
+      out.push({ executionId, kind, title, outcome: "Merged", tone: "forest", at });
+    else if (kind === "change" && d.status === "delivered_pending_merge")
+      out.push({ executionId, kind, title, outcome: "PR opened", tone: "info", at });
+  }
+  return out.sort((a, b) => String(b.at ?? "").localeCompare(String(a.at ?? "")));
 }

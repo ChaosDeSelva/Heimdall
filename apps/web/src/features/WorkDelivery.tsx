@@ -1,6 +1,7 @@
 // Inspector views for research and PR review deliveries. A research document is decided here
 // (accept, reject, follow-up) through the command dialog; a PR review is read here and edited and
 // posted in Sindri, which holds the posting approval.
+import { DrawerActions } from "../app/DrawerActions";
 import {
   Badge,
   Button,
@@ -12,6 +13,7 @@ import {
   KeyValue,
   ResearchDoc,
   Stack,
+  Tabs,
   Textarea,
   Timestamp,
   cn,
@@ -23,9 +25,15 @@ import { useHeimdall } from "../app/context";
 import { Reasons, Status } from "../components/app";
 import type { R } from "../lib/api";
 import { sindriDeliveryHref } from "../lib/apps";
+import { hrefFor, navigate } from "../lib/router";
 import { useDetail, WorkKindBadge } from "./WorkForms";
+import { renderDiagrams } from "../components/Mermaid";
+import { scopeOf } from "./scope";
+import { FactCheckList } from "./FactCheckList";
 import {
   docSources,
+  documentDecision,
+  findingCounts,
   leakCheckOf,
   postedUrl,
   researchChecksPassed,
@@ -159,13 +167,23 @@ export function ResearchView({
   const decision: R | null = research.decision ?? null;
   const markdown: string | null = research.document?.markdown ?? null;
   const checksFailed = !researchChecksPassed(research);
+  // Only the fact-check asked for changes: re-running the checks re-reads the same verdict.
+  const changesOnly =
+    checksFailed &&
+    research.factCheck?.verdict === "request_changes" &&
+    researchChecksPassed({ ...research, factCheck: null });
   const access = actionBlock("research.accept", undefined, session);
   const decided = decision
     ? `This document was already ${decision.decision}.`
     : "";
   const rejectWhy = access || decided;
   const acceptWhy =
-    rejectWhy || (checksFailed ? "The quality checks have not passed." : "");
+    rejectWhy ||
+    (changesOnly
+      ? "The fact-check asked for changes. Ask a follow-up (its fact-check runs again), or reject it."
+      : checksFailed
+        ? "The quality checks have not passed."
+        : "");
   const followWhy =
     actionBlock("research.followUp", undefined, session) ||
     (question.trim() ? "" : "Ask a question first.");
@@ -192,11 +210,7 @@ export function ResearchView({
             <Badge tone="forest">Contains private lessons</Badge>
           )}
         </Cluster>
-        {research.question && (
-          <p className="text-sm font-medium [overflow-wrap:anywhere]">
-            {research.question}
-          </p>
-        )}
+        {research.question && <Question text={String(research.question)} />}
         {decision && (
           <KeyValue
             items={[
@@ -217,31 +231,73 @@ export function ResearchView({
             ]}
           />
         )}
-        <Cluster gap={2}>
-          <Button
-            variant="primary"
-            disabledReason={acceptWhy || undefined}
-            onClick={() =>
-              propose("research.accept", executionId, { reason: "" })
-            }
-          >
-            Accept document
-          </Button>
-          <Button
-            variant="danger"
-            disabledReason={rejectWhy || undefined}
-            onClick={() =>
-              propose("research.reject", executionId, { reason: "" })
-            }
-          >
-            Reject document
-          </Button>
-        </Cluster>
-        <p className="text-xs text-muted">
-          The reason you give when you confirm is sent to Sindri with your
-          decision. A rejection needs one.
-        </p>
-        <Reasons reasons={[acceptWhy, rejectWhy]} />
+        <DrawerActions>
+          {decision ? (
+            <div className="flex min-w-0 flex-1 flex-col gap-2">
+              {decision.decision === "accepted" && (
+                <Button
+                  variant="primary"
+                  className="w-full"
+                  onClick={() =>
+                    navigate(
+                      hrefFor("new-work", {
+                        project: report.projectId,
+                        context: executionId,
+                      }),
+                    )
+                  }
+                >
+                  Start new work with this as context
+                </Button>
+              )}
+              <p className="text-sm text-muted">
+                {decided} Find it again on the Documents page.
+              </p>
+            </div>
+          ) : (
+            <>
+              {checksFailed && !changesOnly && (
+                // Without this a failed check is a dead end: Accept stays disabled until the checks
+                // run again (for example after a fix to how they read the files).
+                <Button
+                  variant="secondary"
+                  disabledReason={
+                    actionBlock("execution.assess", undefined, session) ||
+                    undefined
+                  }
+                  onClick={() => propose("execution.assess", executionId, {})}
+                >
+                  Re-run quality checks
+                </Button>
+              )}
+              <div className="flex w-full gap-2 [&>*]:flex-1">
+                <Button
+                  variant="primary"
+                  disabledReason={acceptWhy || undefined}
+                  onClick={() =>
+                    propose("research.accept", executionId, { reason: "" })
+                  }
+                >
+                  Accept document
+                </Button>
+                <Button
+                  variant="danger"
+                  disabledReason={rejectWhy || undefined}
+                  onClick={() =>
+                    propose("research.reject", executionId, { reason: "" })
+                  }
+                >
+                  Reject document
+                </Button>
+              </div>
+              <p className="text-xs text-muted">
+                The reason you give when you confirm is sent to Sindri with your
+                decision. A rejection needs one.
+              </p>
+              <Reasons reasons={[acceptWhy, rejectWhy]} />
+            </>
+          )}
+        </DrawerActions>
         <Disclosure title="Ask a follow-up question">
           <Stack gap={3}>
             <Field
@@ -333,12 +389,15 @@ export function ResearchView({
               label: "Fact-check",
               value: research.factCheck ? (
                 <span className="flex flex-wrap items-center gap-2">
-                  <span>{verdictLabel(research.factCheck.verdict)}</span>
+                  <span>
+                    {research.factCheck.verdict === "request_changes" &&
+                    findingCounts(research.factCheck.findings)
+                      ? findingCounts(research.factCheck.findings)
+                      : verdictLabel(research.factCheck.verdict)}
+                  </span>
                   {typeof research.factCheck.gatePassed === "boolean" && (
                     <Status
-                      value={
-                        research.factCheck.gatePassed ? "passed" : "failed"
-                      }
+                      value={factCheckResult(research.factCheck)}
                       domain="gate"
                     />
                   )}
@@ -351,11 +410,438 @@ export function ResearchView({
         />
         <Failures failures={research.gate?.failures} />
         {research.factCheck && (
-          <FindingsTable
+          <FactCheckList
             findings={factFindings}
             caption="Fact-check findings"
             emptyText="The fact-check found nothing to correct."
           />
+        )}
+      </Block>
+      <GuidanceUsed guidance={report.guidance} />
+    </Stack>
+  );
+}
+
+/** Whether a plan's own checks passed: every project's findings, the writer's documents, the check. */
+export function planChecksPassed(plan: R): boolean {
+  const findings: R[] = Array.isArray(plan.findings) ? plan.findings : [];
+  return (
+    plan.gate?.passed === true &&
+    findings.every((f) => f.gate?.passed === true) &&
+    (plan.factCheck == null || plan.factCheck.gatePassed !== false)
+  );
+}
+
+const download = (name: string, markdown: string) => {
+  const url = URL.createObjectURL(
+    new Blob([markdown], { type: "text/markdown" }),
+  );
+  const a = Object.assign(document.createElement("a"), {
+    href: url,
+    download: name,
+  });
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+/**
+ * A plan from text: the readable proposal and its engineering appendix (diagrams drawn), each
+ * project's findings, the checks, and the decision (accept, reject or revise).
+ */
+export function ProposalView({
+  executionId,
+  report,
+}: {
+  executionId: string;
+  report: R;
+}) {
+  const { session, propose, notify, state, open } = useHeimdall();
+  // A later revision someone decided on replaces this version: nothing waits on it.
+  const replacedBy = documentDecision(
+    scopeOf(state, "all").deliveries,
+    executionId,
+  )?.replacedBy;
+  const plan: R = report.proposal ?? {};
+  const [feedback, setFeedback] = useState("");
+  const sources = docSources(plan.sources);
+  const decision: R | null = plan.decision ?? null;
+  const proposal: string | null = plan.proposal?.markdown ?? null;
+  const engineering: string | null = plan.engineering?.markdown ?? null;
+  const findings: R[] = Array.isArray(plan.findings) ? plan.findings : [];
+  const checksFailed = !planChecksPassed(plan);
+  // Only the fact-check asked for changes: re-running the checks re-reads the same verdict.
+  const changesOnly =
+    checksFailed &&
+    plan.factCheck?.verdict === "request_changes" &&
+    planChecksPassed({ ...plan, factCheck: null });
+  const access = actionBlock("research.accept", undefined, session);
+  const decided = decision
+    ? `This plan was already ${decision.decision}.`
+    : replacedBy
+      ? "A later revision of this plan was decided, so this version no longer needs a decision."
+      : "";
+  const rejectWhy = access || decided;
+  // Only the fact-check's opinion failed: the operator may accept over it, with a reason.
+  const acceptWhy =
+    rejectWhy ||
+    (checksFailed && !changesOnly ? "The quality checks have not passed." : "");
+  const reviseWhy =
+    actionBlock("research.followUp", undefined, session) ||
+    (feedback.trim() ? "" : "Say what to change first.");
+  const factFindings = tableFindings(plan.factCheck?.findings, "fc");
+  const copy = (markdown: string, what: string) =>
+    void navigator.clipboard.writeText(markdown).then(
+      () => notify(`Copied the ${what}.`, "success"),
+      () => notify("The clipboard is not available here.", "warning"),
+    );
+  const doc = (
+    markdown: string | null,
+    name: string,
+    what: string,
+    empty: string,
+  ) =>
+    markdown ? (
+      <Stack gap={3}>
+        <Cluster gap={2}>
+          <Button
+            size="sm"
+            variant="secondary"
+            icon="copy"
+            onClick={() => copy(markdown, what)}
+          >
+            Copy as Markdown
+          </Button>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => download(name, markdown)}
+          >
+            Download {name}
+          </Button>
+        </Cluster>
+        <div className="rounded-md border border-line p-4">
+          <ResearchDoc
+            markdown={markdown}
+            sources={sources}
+            renderCode={renderDiagrams}
+          />
+        </div>
+      </Stack>
+    ) : (
+      <Callout tone="warning">{empty}</Callout>
+    );
+  const projectName = (f: R) =>
+    f.project ? String(f.project) : "This project";
+  return (
+    <Stack gap={6}>
+      <Block title="Plan">
+        <Cluster gap={2}>
+          {decision ? (
+            <Badge
+              tone={decision.decision === "accepted" ? "forest" : "danger"}
+            >
+              {decision.decision === "accepted"
+                ? decision.overrodeFactCheck
+                  ? "Accepted over the fact-check"
+                  : "Accepted"
+                : "Rejected"}
+            </Badge>
+          ) : (
+            <Badge tone={replacedBy ? "neutral" : "warning"}>
+              {replacedBy ? "Replaced by a revision" : "Awaiting your decision"}
+            </Badge>
+          )}
+          <Badge tone="neutral">
+            {findings.length} {findings.length === 1 ? "project" : "projects"}{" "}
+            researched
+          </Badge>
+        </Cluster>
+        {decision && (
+          <KeyValue
+            items={[
+              {
+                label: "Decided",
+                value: (
+                  <span className="[overflow-wrap:anywhere]">
+                    {decision.actor}
+                    {decision.decidedAt ? (
+                      <>
+                        , <Timestamp value={decision.decidedAt} />
+                      </>
+                    ) : null}
+                    {decision.reason ? ` · ${decision.reason}` : ""}
+                  </span>
+                ),
+              },
+            ]}
+          />
+        )}
+        <DrawerActions>
+          {replacedBy && !decision ? (
+            <div className="flex min-w-0 flex-1 flex-col gap-2">
+              <Button
+                variant="primary"
+                className="w-full"
+                onClick={() =>
+                  open("deliveries", {
+                    id: replacedBy,
+                    executionId: replacedBy,
+                    title: "Plan",
+                  })
+                }
+              >
+                Open the revision that replaced it
+              </Button>
+              <p className="text-sm text-muted">{decided}</p>
+            </div>
+          ) : decision ? (
+            <div className="flex min-w-0 flex-1 flex-col gap-2">
+              {decision.decision === "accepted" && (
+                <Button
+                  variant="primary"
+                  className="w-full"
+                  onClick={() =>
+                    navigate(
+                      hrefFor("new-work", {
+                        project: report.projectId,
+                        context: executionId,
+                      }),
+                    )
+                  }
+                >
+                  Start new work with this as context
+                </Button>
+              )}
+              <p className="text-sm text-muted">
+                {decided} Find it again on the Documents page.
+              </p>
+            </div>
+          ) : (
+            <>
+              {checksFailed && !changesOnly && (
+                <Button
+                  variant="secondary"
+                  disabledReason={
+                    actionBlock("execution.assess", undefined, session) ||
+                    undefined
+                  }
+                  onClick={() => propose("execution.assess", executionId, {})}
+                >
+                  Re-run quality checks
+                </Button>
+              )}
+              <div className="flex w-full gap-2 [&>*]:flex-1">
+                <Button
+                  variant="primary"
+                  disabledReason={acceptWhy || undefined}
+                  onClick={() =>
+                    propose("research.accept", executionId, {
+                      reason: "",
+                      document: "plan",
+                      ...(changesOnly ? { override: true } : {}),
+                    })
+                  }
+                >
+                  {changesOnly ? "Accept over the fact-check" : "Accept plan"}
+                </Button>
+                <Button
+                  variant="danger"
+                  disabledReason={rejectWhy || undefined}
+                  onClick={() =>
+                    propose("research.reject", executionId, {
+                      reason: "",
+                      document: "plan",
+                    })
+                  }
+                >
+                  Reject plan
+                </Button>
+              </div>
+              <Reasons reasons={[acceptWhy, rejectWhy]} />
+              {changesOnly && !acceptWhy && (
+                <p className="text-sm text-muted">
+                  The fact-check asked for changes. Revise the plan above (its
+                  fact-check runs again), or accept it as it is: your reason is
+                  recorded with the decision.
+                </p>
+              )}
+            </>
+          )}
+        </DrawerActions>
+        {changesOnly && !decision && !replacedBy && (
+          <Callout tone="warning" title="The fact-check asked for changes">
+            {findingCounts(plan.factCheck?.findings) || "See its findings"}.
+            Read them in the Fact-check tab below. Revise the plan here (the
+            writer gets every finding, and the fact-check runs again), or accept
+            it over the fact-check with your reason.
+          </Callout>
+        )}
+        <Disclosure
+          title="Revise the plan"
+          defaultOpen={changesOnly && !decision && !replacedBy}
+        >
+          <Stack gap={3}>
+            <Field
+              label="What to change"
+              hint="Starts a new plan over the same projects. Its writer gets this plan, its appendix and the fact-check to revise."
+            >
+              <Textarea
+                value={feedback}
+                onChange={(e) => setFeedback(e.target.value)}
+              />
+            </Field>
+            {changesOnly && !feedback.trim() && (
+              <div>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() =>
+                    setFeedback(
+                      `Fix every finding the fact-check raised (${findingCounts(plan.factCheck?.findings)}). Where a finding is a judgement call, say what you decided and why.`,
+                    )
+                  }
+                >
+                  Fill in: fix the fact-check's findings
+                </Button>
+              </div>
+            )}
+            <div>
+              <Button
+                variant="secondary"
+                disabledReason={reviseWhy || undefined}
+                onClick={() =>
+                  propose(
+                    "research.followUp",
+                    executionId,
+                    { question: feedback.trim(), document: "plan" },
+                    {},
+                    { onSuccess: () => setFeedback("") },
+                  )
+                }
+              >
+                Revise
+              </Button>
+            </div>
+            <Reasons reasons={[reviseWhy]} />
+          </Stack>
+        </Disclosure>
+      </Block>
+      <Tabs
+        label="Plan documents"
+        items={[
+          {
+            value: "proposal",
+            label: "Proposal",
+            content: doc(
+              proposal,
+              "proposal.md",
+              "proposal",
+              "No proposal was recorded for this run.",
+            ),
+          },
+          {
+            value: "engineering",
+            label: "Engineering appendix",
+            content: doc(
+              engineering,
+              "engineering.md",
+              "engineering appendix",
+              "No engineering appendix was recorded for this run.",
+            ),
+          },
+          ...(plan.factCheck
+            ? [
+                {
+                  value: "fact-check",
+                  label: "Fact-check",
+                  count: factFindings.length,
+                  content: (
+                    <FactCheckList
+                      findings={factFindings}
+                      caption="Fact-check findings"
+                      emptyText="The fact-check found nothing to correct."
+                    />
+                  ),
+                },
+              ]
+            : []),
+          {
+            value: "findings",
+            label: "Findings",
+            count: findings.length,
+            content: (
+              <Stack gap={3}>
+                {findings.map((f) => (
+                  <Disclosure key={String(f.planTaskId)} title={projectName(f)}>
+                    <Stack gap={2}>
+                      {f.gate && (
+                        <Status
+                          value={f.gate.passed ? "passed" : "failed"}
+                          domain="gate"
+                        />
+                      )}
+                      <Failures failures={f.gate?.failures} />
+                      {f.document?.markdown ? (
+                        <ResearchDoc
+                          markdown={String(f.document.markdown)}
+                          sources={[]}
+                          renderCode={renderDiagrams}
+                        />
+                      ) : (
+                        <p className="text-sm text-muted">
+                          No findings were recorded.
+                        </p>
+                      )}
+                    </Stack>
+                  </Disclosure>
+                ))}
+              </Stack>
+            ),
+          },
+        ]}
+      />
+      <Block title="Checks">
+        <KeyValue
+          items={[
+            {
+              label: "Documents",
+              value: plan.gate ? (
+                <Status
+                  value={plan.gate.passed ? "passed" : "failed"}
+                  domain="gate"
+                />
+              ) : (
+                "Not reported"
+              ),
+            },
+            {
+              label: "Fact-check",
+              value: plan.factCheck ? (
+                <span className="flex flex-wrap items-center gap-2">
+                  <span>
+                    {plan.factCheck.verdict === "request_changes" &&
+                    findingCounts(plan.factCheck.findings)
+                      ? findingCounts(plan.factCheck.findings)
+                      : verdictLabel(plan.factCheck.verdict)}
+                  </span>
+                  {typeof plan.factCheck.gatePassed === "boolean" && (
+                    <Status
+                      value={factCheckResult(plan.factCheck)}
+                      domain="gate"
+                    />
+                  )}
+                </span>
+              ) : (
+                "Off for this plan"
+              ),
+            },
+          ]}
+        />
+        <Failures failures={plan.gate?.failures} />
+        {plan.factCheck && (
+          <p className="text-sm text-muted">
+            The fact-check&apos;s findings are in the Fact-check tab above.
+          </p>
         )}
       </Block>
       <GuidanceUsed guidance={report.guidance} />
@@ -551,4 +1037,30 @@ export function PrReviewView({
       <GuidanceUsed guidance={report.guidance} />
     </Stack>
   );
+}
+
+/** The request a document answers: a pasted transcript is long, so it opens folded. */
+function Question({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const long = text.length > 400;
+  return (
+    <div className="flex flex-col items-start gap-1">
+      <p className="text-sm font-medium whitespace-pre-wrap [overflow-wrap:anywhere]">
+        {long && !open ? `${text.slice(0, 400).trimEnd()}…` : text}
+      </p>
+      {long && (
+        <Button variant="link" size="sm" onClick={() => setOpen((o) => !o)}>
+          {open
+            ? "Show less"
+            : `Show the whole request (${text.length.toLocaleString("en-US")} characters)`}
+        </Button>
+      )}
+    </div>
+  );
+}
+
+/** The fact-check's gate badge: asking for changes is not a failure of the check itself. */
+function factCheckResult(f: R): "passed" | "request_changes" | "failed" {
+  if (f.gatePassed === true) return "passed";
+  return f.verdict === "request_changes" ? "request_changes" : "failed";
 }

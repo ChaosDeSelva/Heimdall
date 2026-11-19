@@ -1,16 +1,19 @@
 // Quality & approvals: what waits on a human decision in the selected project, then each run's
 // verification gates and delivery. Actions open in the inspector, where the reasons a control is
 // unavailable are shown.
+import { describeReason } from "../features/reasonCodes";
 import {
   Badge,
   Button,
   Card,
   DataTable,
+  Disclosure,
   EmptyState,
   Page,
   PageHeader,
   Section,
   Stack,
+  Timestamp,
   type Column,
 } from "@factory/ui";
 import { useHeimdall } from "../app/context";
@@ -20,9 +23,20 @@ import { navigate } from "../lib/router";
 import { RaiseBudgetButton } from "../features/Budget";
 import { openEscalations } from "../features/profileForm";
 import { isBudgetBlocked, type Scope } from "../features/scope";
-import { deliveryTitle, runTitle } from "../features/workflowState";
+import {
+  actionBlock,
+  decisionDetail,
+  deliveryTitle,
+  revisionOf,
+  runTitle,
+} from "../features/workflowState";
 import { WorkKindBadge } from "../features/WorkForms";
-import { documentWaiting, pendingDocuments } from "../features/workKinds";
+import { RunStatus } from "../features/RunStatus";
+import {
+  documentWaiting,
+  gateResult,
+  pendingDocuments,
+} from "../features/workKinds";
 
 interface Decision {
   id: string;
@@ -81,11 +95,13 @@ export function decisions(scope: Scope, specs: R[]): Decision[] {
       out.push({
         id: kind + ":" + r.id,
         kind,
-        title: String(r.title ?? `Plan v${r.version}`),
-        detail:
-          r.status === "review"
-            ? "Ready for your review"
-            : "Draft: submit it for review first",
+        // A plan has no title of its own: it plans its specification.
+        title: String(
+          r.title ??
+            scope.specs.find((spec) => spec.id === r.specId)?.title ??
+            `Plan v${r.version}`,
+        ),
+        detail: decisionDetail(kind, r, revisionOf(r, scope)),
         status: r.status,
         open: [kind === "Plan" ? "plans" : "specs", r],
         row: r,
@@ -99,8 +115,55 @@ export const qualityCount = (scope: Scope) =>
   pendingDocuments(scope.deliveries).length;
 
 export function QualityPage() {
-  const { state, scope, projectName, open, href } = useHeimdall();
+  const { state, scope, projectName, open, href, propose, session } =
+    useHeimdall();
   const specs: R[] = state?.sindri?.specs ?? [];
+  const restoreWhy = actionBlock("execution.restore", undefined, session);
+  /** A removed run's title, from its plan's specification (removed runs are summary rows). */
+  const removedTitle = (e: R) => {
+    const plan = (state?.sindri?.plans ?? []).find((p: R) => p.id === e.planId);
+    return (
+      specs.find((spec) => spec.id === plan?.specId)?.title ??
+      plan?.title ??
+      "Run " + e.id
+    );
+  };
+  const removedColumns: Column<R>[] = [
+    {
+      key: "run",
+      header: "Run",
+      primary: true,
+      cell: (e) => (
+        <span className="flex min-w-0 flex-col">
+          <span className="line-clamp-2 font-medium">{removedTitle(e)}</span>
+          {e.removedReason && (
+            <span className="line-clamp-2 text-xs font-normal text-muted">
+              {e.removedReason}
+            </span>
+          )}
+        </span>
+      ),
+    },
+    {
+      key: "removed",
+      header: "Removed",
+      cell: (e) => <Timestamp value={e.removedAt} />,
+    },
+    {
+      key: "restore",
+      header: <span className="sr-only">Restore</span>,
+      cell: (e) => (
+        <Button
+          size="sm"
+          variant="secondary"
+          disabledReason={restoreWhy || undefined}
+          onClick={() => propose("execution.restore", e.id)}
+        >
+          Restore
+        </Button>
+      ),
+    },
+  ];
   const list = decisions(scope, specs);
   const columns: Column<Decision>[] = [
     {
@@ -173,12 +236,20 @@ export function QualityPage() {
       key: "failures",
       header: "Failures",
       cell: (g) =>
-        (g.failures ?? []).length ? (
+        gateResult(g) === "request_changes" ? (
+          <span className="text-xs text-muted">
+            The fact-check asked for changes; nothing broke. Its findings are
+            under Checks in Inspect delivery.
+          </span>
+        ) : (g.failures ?? []).length ? (
           <span className="line-clamp-3 text-xs text-muted">
             {(g.failures ?? [])
-              .map((f: unknown) =>
-                typeof f === "string" ? f : JSON.stringify(f),
-              )
+              .map((f: unknown) => {
+                // Plain words, as Sindri shows them; the raw code is in the source record.
+                if (typeof f === "string") return describeReason(f).words;
+                const x = f as R;
+                return describeReason(String(x.reason ?? ""), x.gateId).words;
+              })
               .join(" · ")}
           </span>
         ) : (
@@ -188,9 +259,7 @@ export function QualityPage() {
     {
       key: "result",
       header: "Result",
-      cell: (g) => (
-        <Status value={g.passed ? "passed" : "failed"} domain="gate" />
-      ),
+      cell: (g) => <Status value={gateResult(g)} domain="gate" />,
     },
   ];
   return (
@@ -279,7 +348,10 @@ export function QualityPage() {
                   flush
                   actions={
                     <>
-                      <Status value={e.execution.status} domain="run" />
+                      <RunStatus
+                        execution={e.execution}
+                        deliveries={scope.deliveries}
+                      />
                       <Button
                         size="sm"
                         variant="ghost"
@@ -337,6 +409,25 @@ export function QualityPage() {
               </Button>
             }
           />
+        )}
+        {scope.removedExecutions.length > 0 && (
+          <Disclosure
+            title={`Removed runs (${scope.removedExecutions.length})`}
+          >
+            <Stack gap={3}>
+              <p className="text-sm text-muted">
+                Runs removed from these lists, for example duplicates. Nothing
+                was deleted; Restore lists a run again as it was.
+              </p>
+              <DataTable
+                caption="Removed runs"
+                columns={removedColumns}
+                rows={scope.removedExecutions}
+                rowKey={(e) => e.id}
+                dense
+              />
+            </Stack>
+          </Disclosure>
         )}
       </Section>
     </Page>

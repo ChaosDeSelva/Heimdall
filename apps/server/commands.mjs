@@ -11,7 +11,49 @@ const TIMEOUTS = {
   // Importing a pull request mirrors the repository and reads the diff with gh.
   "intake.import": 120000,
 };
-export const commandTimeout = (action) => TIMEOUTS[action] ?? 30000;
+/** A chained control waits for its slowest step too. */
+export const commandTimeout = (action, body = {}) =>
+  Math.max(
+    TIMEOUTS[action] ?? 30000,
+    body.thenPropose || body.thenDraft
+      ? TIMEOUTS["plan.propose"] + (body.thenStart ? TIMEOUTS["execution.create"] : 0)
+      : body.thenStart
+        ? TIMEOUTS["execution.create"]
+        : 0,
+  );
+
+/** The request a chained `then` step sends, built from the control and its result. */
+export function thenRequest(then, c, result) {
+  if (then === "plan.propose")
+    return { path: "/v1/plans/propose", body: { specId: c.id } };
+  if (then === "execution.create")
+    return { path: "/v1/executions", body: { planId: c.id } };
+  if (then === "spec.draft") {
+    const intake = result?.intake;
+    if (!intake?.id) throw Error("Sindri returned no intake to draft from");
+    // Same request text as "Draft specification from intake": the body, else the title.
+    const request =
+      typeof intake.body === "string" && intake.body.trim()
+        ? intake.body
+        : intake.title;
+    return {
+      path: "/v1/director/draft",
+      body: { projectId: intake.projectId, intakeId: intake.id, request },
+    };
+  }
+  // A revision's plan, approved and started in the same click as its spec: it repeats a kind of
+  // plan the operator already approved once. Submitting may already be done.
+  if (then === "plan.start") {
+    const planId = result?.plan?.id;
+    if (!planId) throw Error("Sindri returned no plan to start");
+    return [
+      { path: `/v1/plans/${planId}/submit`, body: {}, doneOk: true },
+      { path: `/v1/plans/${planId}/approve`, body: {} },
+      { path: "/v1/executions", body: { planId } },
+    ];
+  }
+  throw Error("Unknown chained step");
+}
 // Accepting a recommendation of these types performs the approval, so it needs the human factor.
 export const APPROVAL_DECISION_TYPES = ["spec.approve", "plan.approve"];
 // Types known to need no approval factor; any other (newer) type is treated as an approval.
@@ -129,7 +171,10 @@ export function commandRoute(c) {
   const body = { ...(c.body ?? {}) };
   let source,
     path,
-    method = "POST";
+    method = "POST",
+    // A chained control: `before` paths run first, then the control, then the `then` action.
+    before = [],
+    then;
   if (
     ["mission.pause", "mission.resume", "mission.cancel"].includes(c.action)
   ) {
@@ -181,12 +226,41 @@ export function commandRoute(c) {
     source = "sindri";
     const [resource, verb] = c.action.split(".");
     path = `/v1/${resource}s/${id}/${verb}`;
+    // One click from a draft: submit, approve, then plan the spec or start the plan.
+    if (verb === "approve") {
+      if (body.submitFirst === true) before = [`/v1/${resource}s/${id}/submit`];
+      if (resource === "spec" && body.thenPropose === true)
+        then =
+          body.thenStart === true ? ["plan.propose", "plan.start"] : "plan.propose";
+      if (resource === "plan" && body.thenStart === true)
+        then = "execution.create";
+      delete body.submitFirst;
+      delete body.thenPropose;
+      delete body.thenStart;
+    }
   } else if (["execution.assess", "execution.export"].includes(c.action)) {
     source = "sindri";
     path = `/v1/executions/${id}/${c.action.endsWith("export") ? "pr" : "assess"}`;
   } else if (c.action === "execution.cancel") {
     source = "sindri";
     path = `/v1/executions/${id}/cancel`;
+  } else if (c.action === "execution.restart") {
+    // Sindri records why with the restart: the dialog's audit reason.
+    source = "sindri";
+    path = `/v1/executions/${id}/restart`;
+    for (const key of Object.keys(body)) delete body[key];
+    body.reason = text(c.reason, "A restart reason", 2000);
+  } else if (c.action === "execution.remove") {
+    // Hides a finished run from every list; Sindri keeps it, with the dialog's reason.
+    source = "sindri";
+    path = `/v1/executions/${id}/remove`;
+    for (const key of Object.keys(body)) delete body[key];
+    body.reason = text(c.reason, "A reason for removing the run", 2000);
+  } else if (c.action === "execution.restore") {
+    source = "sindri";
+    path = `/v1/executions/${id}/restore`;
+    for (const key of Object.keys(body)) delete body[key];
+    body.reason = text(c.reason, "A reason for restoring the run", 2000);
   } else if (c.action === "project.profile") {
     // The body is the whole profile; Sindri replaces the stored one with it.
     source = "sindri";
@@ -197,20 +271,38 @@ export function commandRoute(c) {
     source = "sindri";
     path = `/v1/deliveries/${id}/rework`;
   } else if (["research.accept", "research.reject"].includes(c.action)) {
-    // Only the dialog's audit reason is forwarded, as the decision's reason.
+    // Only the dialog's audit reason is forwarded, as the decision's reason (and an override).
     source = "sindri";
     path = `/v1/executions/${id}/${c.action.split(".")[1]}`;
     const reason = typeof body.reason === "string" ? body.reason.trim() : "";
     if (c.action === "research.reject" && !reason)
       throw Error("A rejection reason is required");
+    // Accepting over a fact-check that only asked for changes; Sindri requires the reason.
+    const override = c.action === "research.accept" && body.override === true;
+    if (override && !reason) throw Error("Say why you accept over the fact-check");
     for (const key of Object.keys(body)) delete body[key];
     if (reason) body.reason = text(reason, "A reason", 2000);
+    if (override) body.override = true;
   } else if (c.action === "research.followUp") {
     source = "sindri";
     path = `/v1/executions/${id}/follow-up`;
     const question = text(body.question, "A follow-up question");
     for (const key of Object.keys(body)) delete body[key];
     body.question = question.trim();
+  } else if (c.action === "contextFile.upload") {
+    // A Markdown file or an image to give new work as context; Sindri checks type and size.
+    source = "sindri";
+    path = "/v1/context-files";
+    const name = text(body.name, "A file name", 300);
+    const mime = typeof body.mime === "string" ? body.mime.slice(0, 100) : "";
+    const contentBase64 = text(body.contentBase64, "The file", 14 * 1024 * 1024);
+    for (const key of Object.keys(body)) delete body[key];
+    Object.assign(body, { name, mime, contentBase64 });
+  } else if (c.action === "contextFile.delete") {
+    source = "sindri";
+    method = "DELETE";
+    path = `/v1/context-files/${id}`;
+    for (const key of Object.keys(body)) delete body[key];
   } else if (c.action === "intake.import") {
     source = "sindri";
     path = "/v1/intakes/import";
@@ -238,6 +330,10 @@ export function commandRoute(c) {
       "plan.propose": "/v1/plans/propose",
       "execution.create": "/v1/executions",
     }[c.action];
+    if (c.action === "intake.create") {
+      if (body.thenDraft === true) then = "spec.draft";
+      delete body.thenDraft;
+    }
   } else if (c.action === "budget.raise") {
     // Mimir's way out of a budget block: new limits for budget_exceeded, `onUnknown` for
     // budget_uncertain (and for a new hard budget when the runtime reports no usage). Only these
@@ -295,5 +391,13 @@ export function commandRoute(c) {
   if (JSON.stringify(body).length > 500000)
     throw Error("Command body too large");
   // Every non-steward Sindri control carries the approval secret.
-  return { source, path, body, method, approval: source === "sindri" };
+  return {
+    source,
+    path,
+    body,
+    method,
+    approval: source === "sindri",
+    ...(before.length ? { before } : {}),
+    ...(then ? { then } : {}),
+  };
 }

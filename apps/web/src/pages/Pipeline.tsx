@@ -15,12 +15,13 @@ import {
 } from "@factory/ui";
 import { useState } from "react";
 import { useHeimdall } from "../app/context";
-import { LearnMore, Status, label } from "../components/app";
+import { IntakeStatus, LearnMore, Status, label } from "../components/app";
 import type { R } from "../lib/api";
 import { navigate } from "../lib/router";
 import { isFinalExecution } from "../features/profileForm";
 import { blockedText, liveAgentOf } from "../features/scope";
 import { WorkKindBadge } from "../features/WorkForms";
+import { RunStatus } from "../features/RunStatus";
 import { kindOf } from "../features/workKinds";
 import {
   deliveryTitle,
@@ -132,7 +133,9 @@ export function PipelinePage() {
     {
       key: "status",
       header: "Status",
-      cell: (e) => <Status value={e.execution.status} domain="run" />,
+      cell: (e) => (
+        <RunStatus execution={e.execution} deliveries={scope.deliveries} />
+      ),
     },
     {
       key: "id",
@@ -275,12 +278,16 @@ export function PipelinePage() {
                                 kind={kindOf(r, plans, executions)}
                               />
                             )}
-                            <Status
-                              value={statusBadge(kind, r)}
-                              domain={kind === "tasks" ? "task" : undefined}
-                              size="sm"
-                              tooltip={false}
-                            />
+                            {kind === "intakes" ? (
+                              <IntakeStatus row={r} specs={specs} size="sm" />
+                            ) : (
+                              <Status
+                                value={statusBadge(kind, r)}
+                                domain={kind === "tasks" ? "task" : undefined}
+                                size="sm"
+                                tooltip={false}
+                              />
+                            )}
                             <span className="truncate font-mono text-xs text-muted">
                               {["specs", "plans"].includes(kind) &&
                               r.version != null

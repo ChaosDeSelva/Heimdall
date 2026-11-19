@@ -1,15 +1,47 @@
 // Every operator command stops here: what it does, its target and payload, and the audit reason.
-import { Button, Callout, Dialog, Field, Id, Textarea } from "@factory/ui";
+import {
+  Button,
+  Callout,
+  Dialog,
+  Disclosure,
+  Field,
+  Id,
+  Textarea,
+} from "@factory/ui";
 import { useEffect, useRef } from "react";
 import { Raw } from "../components/app";
 import type { R } from "../lib/api";
 
 /** "mission.pause" → "Pause mission"; unknown actions fall back to their words. */
-export function commandTitle(action: string): string {
+export function commandTitle(action: string, body: R = {}): string {
+  // Chained controls (one click from a draft) are named for everything they do.
+  if (action === "spec.approve" && body.thenPropose)
+    return body.thenStart ? "Approve, plan and start" : "Approve and plan";
+  if (action === "plan.approve" && body.thenStart) return "Approve and start";
+  if (action === "intake.create" && body.thenDraft)
+    return "Save and draft spec";
+  if (action === "research.accept" && body.override)
+    return body.document === "plan"
+      ? "Accept plan over the fact-check"
+      : "Accept over the fact-check";
+  if (body.document === "plan") {
+    const plan: Record<string, string> = {
+      "research.accept": "Accept plan",
+      "research.reject": "Reject plan",
+      "research.followUp": "Revise plan",
+    };
+    if (plan[action]) return plan[action];
+  }
   const known: Record<string, string> = {
     "budget.raise": "Raise budget",
     "execution.create": "Start approved plan",
+    "plan.start": "Start the plan",
+    "contextFile.upload": "Upload a context file",
+    "contextFile.delete": "Delete an uploaded file",
     "execution.cancel": "Cancel run",
+    "execution.restart": "Restart run",
+    "execution.remove": "Remove run",
+    "execution.restore": "Restore run",
     "execution.resolve": "Resolve escalation",
     "execution.assess": "Reassess quality gates",
     "execution.export": "Request local export",
@@ -56,7 +88,8 @@ export function CommandDialog({
   // operator types next, so move focus there once the dialog has settled.
   useEffect(() => {
     if (!command) return;
-    const frame = requestAnimationFrame(() => reasonField.current?.focus());
+    // The reason starts prefilled; selecting it lets typing replace it.
+    const frame = requestAnimationFrame(() => reasonField.current?.select());
     return () => cancelAnimationFrame(frame);
   }, [command]);
   return (
@@ -64,8 +97,8 @@ export function CommandDialog({
       open={!!command}
       onOpenChange={(open) => !open && onCancel()}
       busy={busy}
-      title={command ? commandTitle(command.action) : ""}
-      description="This request changes the owning service. Review the details and record why you are taking this action."
+      title={command ? commandTitle(command.action, command.body) : ""}
+      description="Confirm to send this to the factory. The reason is kept in the audit history."
       size="md"
       footer={
         <>
@@ -80,22 +113,40 @@ export function CommandDialog({
             }
             onClick={onSend}
           >
-            {busy ? "Waiting for source…" : "Send to source"}
+            {busy ? "Sending…" : "Confirm"}
           </Button>
         </>
       }
     >
       {command && (
         <div className="flex flex-col gap-4">
-          <p className="flex flex-wrap items-center gap-2 text-sm">
-            <span className="text-muted">Target</span>
-            <Id value={String(command.id)} />
-            <code className="text-xs text-muted">{command.action}</code>
-          </p>
-          <Raw data={command.body} title="Command payload" />
+          <Disclosure title="Technical details">
+            <div className="flex flex-col gap-3">
+              <p className="flex flex-wrap items-center gap-2 text-sm">
+                <span className="text-muted">Target</span>
+                <Id value={String(command.id)} />
+                <code className="text-xs text-muted">{command.action}</code>
+              </p>
+              <Raw
+                data={
+                  typeof command.body?.contentBase64 === "string"
+                    ? {
+                        ...command.body,
+                        contentBase64: `(${command.body.contentBase64.length.toLocaleString("en-US")} characters of file content)`,
+                      }
+                    : command.body
+                }
+                title="Command payload"
+              />
+            </div>
+          </Disclosure>
           <Field
             label="Reason"
-            hint="Recorded with the command in the audit history."
+            hint={
+              "reason" in (command.body ?? {})
+                ? "Sent to the factory with your decision."
+                : "Prefilled as a note for the audit history; edit it if you like."
+            }
           >
             <Textarea
               ref={reasonField}

@@ -190,8 +190,8 @@ try {
   await page.goto(h.url);
 
   await page
-    .getByRole("banner")
-    .getByRole("button", { name: "New work", exact: true })
+    .getByRole("navigation", { name: "Project pages" })
+    .getByRole("link", { name: /^In progress(?: \d+)?$/ })
     .click();
   await page.getByRole("button", { name: new RegExp(plan.id) }).click();
   await page
@@ -224,7 +224,7 @@ try {
     .getByLabel("Reason", { exact: true })
     .fill("Browser priority revision acceptance");
   await page
-    .getByRole("button", { name: "Send to source", exact: true })
+    .getByRole("button", { name: "Confirm", exact: true })
     .click();
   await page
     .getByText("Source confirmed the request.", { exact: false })
